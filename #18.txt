@@ -1,0 +1,40 @@
+Bug Title / Short Description (one liner)  :  A user has admin access but shouldn't — we got hacked
+Bug category: Authentication & User Management
+Description: A client discovered a rogue admin account in their user list that nobody on their team created. They suspected a breach via a vulnerable plugin.
+
+
+Main Cause:
+An outdated contact form plugin had an unauthenticated privilege escalation vulnerability — it allowed user role assignment without authentication via a poorly secured AJAX handler.
+
+What we Did:
+First, immediately deleted the rogue account and forced a password reset for all admins. Then audited and patched the vulnerable AJAX hook:
+
+
+// The vulnerable code in the plugin (what we found):
+add_action('wp_ajax_nopriv_update_user_role', 'update_user_role_callback');
+
+function update_user_role_callback() {
+    $user_id = $_POST['user_id'];
+    $role    = $_POST['role'];
+    $user    = new WP_User($user_id);
+    $user->set_role($role); // There was no capability check
+    wp_die();
+}
+
+// The fix — added proper nonce + capability checks:
+add_action('wp_ajax_update_user_role', 'update_user_role_callback'); // removed nopriv
+function update_user_role_callback() {
+    check_ajax_referer('update_role_nonce', 'nonce'); // verify nonce
+    if (!current_user_can('manage_options')) {        // verify capability
+        wp_send_json_error('Unauthorized', 403);
+    }
+    $user_id = intval($_POST['user_id']);
+    $role    = sanitize_text_field($_POST['role']);
+    $user    = new WP_User($user_id);
+    $user->set_role($role);
+    wp_send_json_success('Role updated');
+}
+
+
+Also added Wordfence and set up file change monitoring going forward. 
+

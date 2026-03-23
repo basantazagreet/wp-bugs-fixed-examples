@@ -1,0 +1,22 @@
+Bug Title / Short Description (one liner)  :   Client A  can't log in, it just refreshes the page.
+Bug category: Authentication & User Management
+Description: Client couldn't log in to their WordPress admin. After entering credentials, the login page would simply reload with no error message — a classic login redirect loop.
+
+Main Cause: There were corrupted wordpress_logged_in cookies due to a mismatch between the siteurl and home values in wp-config.php and the database.
+
+What we did:
+We fixed the site URL constants directly in wp-config.php and cleared all cookies:
+
+// wp-config.php
+define('WP_HOME', 'https://client.com');
+define('WP_SITEURL', 'https://client.com');
+
+
+Then We reset the cookie keys by replacing the salts via https://api.wordpress.org/secret-key/1.1/salt/ and updating them in wp-config.php:
+
+define('AUTH_KEY',         'new-unique-value');
+define('SECURE_AUTH_KEY',  'new-unique-value');
+define('LOGGED_IN_KEY',    'new-unique-value');
+
+
+After clearing browser cookies and cache, login worked immediately.

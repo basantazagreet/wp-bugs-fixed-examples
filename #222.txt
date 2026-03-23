@@ -1,0 +1,199 @@
+Bug Title / Short Description (one liner) :  "We changed our permalink structure and now every single page on the site is a 404"
+Bug category: Permalinks & URL Routing
+
+Description: 
+A corporate client switched their WordPress permalink structure from the default plain format (/?p=123) to Post name (/%postname%/) via Settings → Permalinks. Immediately after saving, every page, post, and archive on the site returned a 404 Not Found — including the homepage. The wp-admin remained accessible because it runs through a separate routing path. No error was displayed — just a blank 404 page from the server.
+
+
+
+Main Cause:
+The server was running Apache with mod_rewrite disabled. WordPress's pretty permalinks rely entirely on mod_rewrite to route all non-file requests through index.php. When WordPress saved the new permalink structure, it attempted to write the necessary rewrite rules to .htaccess — but because mod_rewrite was off, Apache ignored those rules completely. Every request for a pretty URL was handled by Apache directly, which found no matching file and returned a 404 before WordPress ever loaded.
+A secondary issue: the .htaccess file was owned by root with permissions 644, meaning the web server user (www-data) could read it but not write to it. WordPress silently failed to update .htaccess and showed no error — leaving the file with only default rules that didn't handle pretty permalinks.
+
+
+
+
+What We Did:
+
+Step 1 — Confirmed mod_rewrite status and .htaccess writeability:
+
+
+# Check if mod_rewrite is enabled
+apache2ctl -M 2>/dev/null | grep rewrite
+# No output — mod_rewrite not loaded
+
+# Check .htaccess ownership and permissions
+ls -la /var/www/html/.htaccess
+# -rw-r--r-- 1 root root 524 .htaccess
+# Owner: root — www-data cannot write to this file
+
+# Check what's currently in .htaccess
+cat /var/www/html/.htaccess
+# Only had basic WordPress single-site rules — no pretty permalink rewrites
+
+
+
+
+Step 2 — Enabled mod_rewrite and fixed .htaccess permissions:
+
+bash# Enable mod_rewrite
+sudo a2enmod rewrite
+sudo systemctl restart apache2
+
+
+# Fix .htaccess ownership so WordPress can write to it
+sudo chown www-data:www-data /var/www/html/.htaccess
+sudo chmod 644 /var/www/html/.htaccess
+
+
+# Ensure the site's VirtualHost allows .htaccess overrides
+# (AllowOverride None blocks .htaccess entirely)
+
+apache# /etc/apache2/sites-available/clientsite.conf
+<VirtualHost *:443>
+    ServerName clientsite.com
+    DocumentRoot /var/www/html
+
+    <Directory /var/www/html>
+        # CRITICAL: Must be 'All' or at minimum 'FileInfo' for WordPress rewrites
+        AllowOverride All
+        Require all granted
+    </Directory>
+</VirtualHost>
+
+bash# Reload Apache after config change
+sudo systemctl reload apache2
+
+
+
+
+
+Step 3 — Re-saved permalinks to trigger .htaccess regeneration:
+
+bash# WP-CLI — flush rewrite rules and regenerate .htaccess
+wp rewrite flush --hard
+
+# Verify .htaccess was updated with correct rules
+
+cat /var/www/html/.htaccess
+The correct .htaccess content WordPress generates:
+
+# BEGIN WordPress
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteBase /
+
+# Don't rewrite requests for existing files
+RewriteRule ^index\.php$ - [L]
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+
+# Route everything else through WordPress
+RewriteRule . /index.php [L]
+</IfModule>
+# END WordPress
+
+
+
+
+
+
+
+Step 4 — For Nginx servers (documented for the client's staging environment):
+
+nginx# /etc/nginx/sites-available/clientsite.conf
+# Nginx does not use .htaccess — rewrite rules go directly in server block
+
+server {
+    listen 443 ssl;
+    server_name clientsite.com;
+    root /var/www/html;
+    index index.php index.html;
+
+    # WordPress permalink routing — the equivalent of mod_rewrite
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    # Pass PHP requests to PHP-FPM
+    location ~ \.php$ {
+        include        fastcgi_params;
+        fastcgi_pass   unix:/run/php/php8.1-fpm.sock;
+        fastcgi_param  SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    }
+
+    # Deny access to sensitive files
+    location ~ /\.(ht|git|env) {
+        deny all;
+    }
+}
+
+
+
+
+
+
+
+
+
+Step 5 — Added a permalink health check to the admin dashboard:
+
+// functions.php — Detect broken permalink configuration proactively
+
+add_action('admin_notices', function() {
+    if (!current_user_can('manage_options')) return;
+
+    // Test if a sample pretty URL resolves correctly
+    $test_url  = home_url('/wp-json/');
+    $response  = wp_remote_head($test_url, ['timeout' => 5, 'sslverify' => false]);
+    $http_code = is_wp_error($response) ? 0 : wp_remote_retrieve_response_code($response);
+
+    if ($http_code !== 200) {
+        echo '<div class="notice notice-error"><p>';
+        printf(
+            '<strong>⚠️ Permalink Routing Issue Detected:</strong> ' .
+            'A test request to <code>%s</code> returned HTTP %d instead of 200. ' .
+            'Your server may not be processing pretty URLs correctly. ' .
+            '<a href="%s">Check Permalink Settings</a> or verify mod_rewrite/Nginx config.',
+            esc_html($test_url),
+            $http_code,
+            esc_url(admin_url('options-permalink.php'))
+        );
+        echo '</p></div>';
+    }
+});
+
+// Also check .htaccess writeability
+add_action('admin_notices', function() {
+    if (!current_user_can('manage_options')) return;
+    if (get_option('permalink_structure') === '') return; // Plain URLs don't need .htaccess
+
+    $htaccess = ABSPATH . '.htaccess';
+    if (file_exists($htaccess) && !is_writable($htaccess)) {
+        echo '<div class="notice notice-warning"><p>';
+        printf(
+            '<strong>Warning:</strong> Your <code>.htaccess</code> file is not writable by WordPress. ' .
+            'Permalink changes may not take effect automatically. ' .
+            'Current owner: <code>%s</code>. The web server needs write access.',
+            esc_html(posix_getpwuid(fileowner($htaccess))['name'] ?? 'unknown')
+        );
+        echo '</p></div>';
+    }
+});
+
+
+
+
+
+
+Every page on the site was accessible again within 4 minutes of enabling mod_rewrite. The client was also given a pre-launch checklist that includes verifying AllowOverride All and mod_rewrite status before any permalink structure change. 
+
+
+
+
+
+
+
+
+
+

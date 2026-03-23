@@ -1,0 +1,163 @@
+Bug Title / Short Description (one liner) : "Page 1 of our blog works fine but pages 2, 3, 4 all return 404"
+Bug category: Permalinks & URL Routing
+
+
+Description: 
+A magazine client reported that their blog archive pagination was broken — clientsite.com/blog/ loaded perfectly, but clientsite.com/blog/page/2/, clientsite.com/blog/page/3/, and all subsequent pages returned 404 Not Found. The posts existed, the archive was correctly configured, and single post pages worked fine. The issue had appeared after the client changed their static front page setting.
+
+
+
+Main Cause:
+The client had configured Settings → Reading → "Your homepage displays" → A static page and set a custom page as the homepage. The "Posts page" dropdown was left as "— Select —" (none selected). When WordPress has a static front page but no designated posts page, it has no registered URL to serve paginated post archives from — so all pagination URLs beyond page 1 fall through to a 404.
+Additionally, the client's permalink structure used /blog/ as a custom base via the "Category base" field — which WordPress interprets differently from a Posts page slug, causing the pagination rewrite rules to generate paths that didn't match any registered rule.
+
+
+
+
+What We Did:
+
+
+Step 1 — Diagnosed the Reading Settings misconfiguration:
+
+bash# Check current Reading settings via WP-CLI
+
+wp option get show_on_front    # 'page' = static front page, 'posts' = blog
+wp option get page_on_front    # ID of the static front page
+wp option get page_for_posts   # ID of the posts page (0 = none set)
+
+# Output:
+# show_on_front  → page
+# page_on_front  → 12
+# page_for_posts → 0  ← Problem: No posts page designated
+
+
+
+
+
+Step 2 — Created and assigned a Posts page:
+
+bash# Create a new page to serve as the posts/blog index
+wp post create \
+    --post_type=page \
+    --post_title='Blog' \
+    --post_name='blog' \
+    --post_status=publish
+
+# Get the new page ID
+BLOG_PAGE_ID=$(wp post list --post_type=page --name=blog --field=ID --format=ids)
+echo "Blog page ID: $BLOG_PAGE_ID"
+
+# Assign it as the Posts page in Reading settings
+wp option update page_for_posts $BLOG_PAGE_ID
+
+# Flush rewrite rules — REQUIRED after changing page_for_posts
+wp rewrite flush --hard
+
+
+
+
+
+
+Step 3 — Verified pagination rewrite rules were now registered:
+
+// functions.php — Temporary pagination rule checker
+add_action('init', function() {
+    if (!isset($_GET['check_pagination']) || !current_user_can('manage_options')) return;
+
+    $rules = get_option('rewrite_rules', []);
+    $pagination_rules = array_filter(
+        array_keys($rules),
+        fn($pattern) => strpos($pattern, 'page/') !== false ||
+                        strpos($pattern, 'paged') !== false
+    );
+
+    echo '<pre>';
+    echo "Pagination rewrite rules found: " . count($pagination_rules) . "\n\n";
+    foreach (array_slice($pagination_rules, 0, 20) as $rule) {
+        echo $rule . ' → ' . $rules[$rule] . "\n";
+    }
+    echo '</pre>';
+    exit;
+});
+
+
+
+
+
+Step 4 — Fixed the custom category base conflict that was interfering with pagination URLs:
+
+// The client had set "Category base" to 'blog' in Settings → Permalinks
+// This caused /blog/page/2/ to be interpreted as category 'blog', page 2
+// rather than the posts page 'blog', page 2
+
+// Solution 1: Clear the custom category base (use default /category/)
+// Go to Settings → Permalinks → Optional → Category base → clear the field
+
+
+// Solution 2: If custom base must stay, use a filter to fix pagination routing
+add_filter('request', function($query_vars) {
+
+    // If we're on /blog/page/N/ — ensure it routes to the posts page, not category
+    if (isset($query_vars['category_name']) && isset($query_vars['paged'])) {
+        $posts_page_slug = get_post_field('post_name', get_option('page_for_posts'));
+        if ($query_vars['category_name'] === $posts_page_slug) {
+            // This is actually the posts page pagination, not a category
+            unset($query_vars['category_name']);
+            $query_vars['paged'] = absint($query_vars['paged']);
+        }
+    }
+    return $query_vars;
+});
+
+
+
+
+
+Step 5 — Added a pagination integrity test that verifies all archive pages beyond page 1 are reachable:
+
+// pagination-health-check.php — Run via: wp eval-file pagination-health-check.php
+$posts_per_page   = get_option('posts_per_page', 10);
+$total_posts      = wp_count_posts('post')->publish;
+$total_pages      = ceil($total_posts / $posts_per_page);
+$posts_page_id    = get_option('page_for_posts');
+$posts_page_slug  = $posts_page_id
+    ? get_post_field('post_name', $posts_page_id)
+    : '';
+
+echo "Total published posts: $total_posts\n";
+echo "Posts per page: $posts_per_page\n";
+echo "Total archive pages: $total_pages\n\n";
+
+// Test the first 5 pages
+$test_pages = min(5, $total_pages);
+for ($page = 1; $page <= $test_pages; $page++) {
+    $url = $page === 1
+        ? home_url('/' . $posts_page_slug . '/')
+        : home_url('/' . $posts_page_slug . '/page/' . $page . '/');
+
+    $response = wp_remote_head($url, ['timeout' => 10, 'sslverify' => false]);
+    $code     = is_wp_error($response)
+        ? 'ERROR: ' . $response->get_error_message()
+        : wp_remote_retrieve_response_code($response);
+
+    $status = $code === 200 ? '✅' : '❌';
+    printf("%s Page %-2d | HTTP %-3s | %s\n", $status, $page, $code, $url);
+}
+
+
+
+
+
+
+
+
+Pages 2 through the final archive page all returned 200 OK immediately after assigning the Posts page and flushing rewrites. The client's pagination had simply never worked since they set up the static front page — this had gone unnoticed because most visitors arrived via direct links. 
+
+
+
+
+
+
+
+
+

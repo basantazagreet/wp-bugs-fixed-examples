@@ -1,0 +1,285 @@
+Bug Title / Short Description (one liner) : "After network-activating a plugin, 3 of our 22 sub-sites go completely white"
+Bug category: Multisite Network
+
+
+Description: 
+An enterprise client running a 22-site Multisite network for a publishing group network-activated a new custom analytics plugin. Nineteen sub-sites continued working normally. Three specific sub-sites — the three highest-traffic ones — immediately showed a White Screen of Death while the rest of the network was unaffected. Deactivating the plugin network-wide restored all three sites.
+
+
+
+
+
+Main Cause:
+The analytics plugin registered a wp_loaded hook that queried post view counts stored in a custom table (wp_post_views). The plugin used $wpdb->prefix to build the table name — but in Multisite, $wpdb->prefix on sub-sites returns the site-specific prefix (wp_3_, wp_7_, wp_15_ for the three affected sites). The plugin's table only existed as wp_post_views (main site prefix), not wp_3_post_views, wp_7_post_views, or wp_15_post_views.
+The query was failing with Table 'wp_3_post_views' doesn't exist, which caused a PHP fatal error. The three specific sites were affected because they had the highest post volumes — the plugin only triggered the fatal when the post count exceeded a threshold that happened to be crossed on those three sites.
+
+php// The broken plugin code:
+add_action('wp_loaded', function() {
+    global $wpdb;
+
+    // In Multisite, $wpdb->prefix is site-specific (e.g., wp_3_)
+    // But the table was only ever created for the main site as wp_post_views
+    $table = $wpdb->prefix . 'post_views'; // wp_3_post_views — doesn't exist
+
+    // This query fatals when the table doesn't exist
+    $top_posts = $wpdb->get_results(
+        "SELECT post_id, view_count FROM {$table}
+         ORDER BY view_count DESC LIMIT 10"
+    );
+    // PHP Fatal: Table 'database.wp_3_post_views' doesn't exist
+});
+
+
+
+
+
+
+
+
+What We Did:
+
+
+
+
+Step 1 — Confirmed the table existence issue across all sites:
+
+
+
+// audit-multisite-tables.php — Run via: wp eval-file audit-multisite-tables.php --url=mainsite.com
+global $wpdb;
+
+$sites = get_sites(['number' => 100]);
+
+echo "Checking post_views table across all sites:\n\n";
+
+foreach ($sites as $site) {
+    switch_to_blog($site->blog_id);
+
+    $table      = $wpdb->prefix . 'post_views';
+    $exists     = $wpdb->get_var("SHOW TABLES LIKE '{$table}'") === $table;
+    $post_count = wp_count_posts('post')->publish;
+
+    printf(
+        "Site %-3d | %-40s | Table: %-5s | Posts: %d\n",
+        $site->blog_id,
+        $wpdb->prefix . 'post_views',
+        $exists ? 'EXISTS' : 'MISSING',
+        $post_count
+    );
+
+    restore_current_blog();
+}
+
+
+
+
+
+
+
+
+Step 2 — Created the missing tables for all sub-sites:
+
+// create-missing-tables.php — Run via WP-CLI for each affected site
+
+global $wpdb;
+$sites = get_sites(['number' => 100]);
+
+foreach ($sites as $site) {
+    switch_to_blog($site->blog_id);
+
+    $table = $wpdb->prefix . 'post_views';
+
+    // Only create if missing
+    if ($wpdb->get_var("SHOW TABLES LIKE '{$table}'") !== $table) {
+        $wpdb->query("
+            CREATE TABLE {$table} (
+                post_id    BIGINT UNSIGNED NOT NULL,
+                view_count BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                last_viewed DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (post_id),
+                KEY idx_view_count (view_count DESC)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ");
+        echo "Created {$table}\n";
+    }
+
+    restore_current_blog();
+}
+echo "Done.\n";
+
+
+
+
+
+
+
+
+Step 3 — Patched the plugin to use $wpdb->base_prefix for shared network tables and to handle missing tables gracefully:
+
+
+// analytics-plugin/plugin.php — Multisite-aware table handling
+
+
+// Option A: Use a SINGLE shared table for all sites (use base_prefix)
+// This is the right choice for network-wide analytics
+function get_analytics_table() {
+    global $wpdb;
+    // base_prefix is always 'wp_' regardless of which sub-site we're on
+    return $wpdb->base_prefix . 'post_views';
+}
+
+
+// Option B: Use per-site tables (use prefix, but create for each site)
+// This is the right choice for isolated per-site analytics
+function get_site_analytics_table() {
+    global $wpdb;
+    return $wpdb->prefix . 'post_views'; // wp_3_post_views, wp_7_post_views, etc.
+}
+
+// Whichever option is chosen — always check table exists before querying
+add_action('wp_loaded', function() {
+    global $wpdb;
+
+    $table = get_analytics_table(); // or get_site_analytics_table()
+
+    // Guard: check table exists before any query
+    if ($wpdb->get_var("SHOW TABLES LIKE '{$table}'") !== $table) {
+    
+        // Table missing — create it on the fly rather than fataling
+        analytics_create_table($table);
+
+        // If creation also fails, log and bail gracefully — never fatal
+        if ($wpdb->get_var("SHOW TABLES LIKE '{$table}'") !== $table) {
+            error_log("Analytics: table {$table} could not be created. Skipping analytics.");
+            return;
+        }
+    }
+
+    $top_posts = $wpdb->get_results(
+        "SELECT post_id, view_count FROM {$table}
+         ORDER BY view_count DESC LIMIT 10"
+    );
+
+    // Store in transient to avoid hitting DB on every page load
+    set_transient('analytics_top_posts_' . get_current_blog_id(), $top_posts, HOUR_IN_SECONDS);
+});
+
+function analytics_create_table($table) {
+    global $wpdb;
+    $charset = $wpdb->get_charset_collate();
+
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    dbDelta("
+        CREATE TABLE {$table} (
+            post_id     BIGINT UNSIGNED NOT NULL,
+            view_count  BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            last_viewed DATETIME        NOT NULL,
+            PRIMARY KEY (post_id)
+        ) {$charset};
+    ");
+}
+
+
+
+
+
+
+
+
+
+
+Step 4 — Hooked into new site creation to automatically provision tables for new sub-sites:
+
+// functions.php (network plugin) — Create plugin tables when new sub-site is added
+add_action('wp_initialize_site', function($new_site) {
+    switch_to_blog($new_site->id);
+
+    // Provision all network-plugin tables for the new site
+    analytics_create_table($GLOBALS['wpdb']->prefix . 'post_views');
+
+    restore_current_blog();
+}, 10, 1);
+
+// Also handle the legacy hook for older WordPress versions
+add_action('wpmu_new_blog', function($blog_id) {
+    switch_to_blog($blog_id);
+    analytics_create_table($GLOBALS['wpdb']->prefix . 'post_views');
+    restore_current_blog();
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+Step 5 — Added a network plugin activation validator to test against all sites before going live:
+
+// network-plugin-validator.php — Run before network-activating any plugin
+
+// Usage: wp eval-file network-plugin-validator.php --url=mainsite.com
+
+$plugin_file = 'analytics-plugin/analytics-plugin.php'; // Change to target plugin
+$sites       = get_sites(['number' => 200]);
+$errors      = [];
+
+echo "Pre-activation test: $plugin_file across " . count($sites) . " sites\n\n";
+
+foreach ($sites as $site) {
+    switch_to_blog($site->blog_id);
+
+    // Simulate the plugin being active by loading its main file
+    // and running its activation hook
+    ob_start();
+    $error_level = error_reporting(0); // Suppress errors — we're catching them
+
+    try {
+        do_action('activate_' . $plugin_file);
+        $output = ob_get_clean();
+        error_reporting($error_level);
+
+        if (!empty($output)) {
+            $errors[] = "Site {$site->blog_id} ({$site->domain}): Unexpected output: " . substr($output, 0, 100);
+        } else {
+            echo "Site {$site->blog_id}: OK\n";
+        }
+    } catch (Throwable $e) {
+        ob_get_clean();
+        error_reporting($error_level);
+        $errors[] = "Site {$site->blog_id} ({$site->domain}): " . $e->getMessage();
+    }
+
+    restore_current_blog();
+}
+
+if (!empty($errors)) {
+    echo "\n⚠️  Issues found on " . count($errors) . " sites:\n";
+    foreach ($errors as $error) echo "  - $error\n";
+    echo "\nDo NOT network-activate this plugin without fixing these issues.\n";
+} else {
+    echo "\n✅ All sites passed. Safe to network-activate.\n";
+}
+
+
+
+
+
+
+
+
+
+
+
+All three affected sub-sites were restored within 10 minutes. The plugin was re-network-activated after table creation and ran cleanly across all 22 sites. 
+
+
+
+
+

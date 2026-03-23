@@ -1,0 +1,251 @@
+Bug Title / Short Description (one liner) :  "A subscriber-level user deleted 340 products and changed our PayPal account credentials"
+Bug category: Security & Permissions
+
+
+Description: 
+A WooCommerce client discovered that a subscriber-level user had performed actions that should be completely impossible without admin privileges — bulk deleting 340 products, changing the PayPal gateway credentials to an attacker-controlled email address, and exporting the full customer list with order history. The site ran a "refer a friend" rewards feature that the attacker had exploited.
+
+
+
+Main Cause:
+The custom referral plugin had a privilege escalation vulnerability via a broken capability check in its AJAX reward handler. The handler checked edit_posts — a capability that WordPress subscribers actually have — instead of a meaningful admin capability. Once inside the handler, a second flaw allowed passing arbitrary WooCommerce action names as the reward_type POST parameter, which were then executed via do_action() with no further checks. The attacker had simply passed woocommerce_update_payment_gateways and other admin actions as the reward type.
+
+
+// The vulnerable AJAX handler:
+add_action('wp_ajax_claim_referral_reward', function() {
+
+    // WRONG capability — subscribers have edit_posts
+    if (!current_user_can('edit_posts')) {
+        wp_send_json_error('Not allowed');
+    }
+
+    $reward_type = sanitize_text_field($_POST['reward_type']);
+
+    // CRITICAL FLAW — executes ANY WooCommerce action passed as reward_type
+    // No allowlist, no additional capability check
+    do_action('woocommerce_reward_' . $reward_type, get_current_user_id(), $_POST);
+
+    wp_send_json_success('Reward claimed!');
+});
+
+
+
+
+
+// What the attacker sent:
+
+// reward_type=update_payment_gateways
+// → do_action('woocommerce_reward_update_payment_gateways', ...)
+
+
+
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Immediate containment — lock account, restore settings, recover data:
+
+# Lock the compromised subscriber account
+wp user update attacker_username --user_pass=$(openssl rand -base64 32)
+
+
+# Restore PayPal credentials from last known-good backup
+wp option update woocommerce_paypal_settings \
+    '{"enabled":"yes","email":"legitimate@client.com","title":"PayPal"}'
+
+
+# Restore deleted products from database backup
+mysqldump backup_db wp_posts wp_postmeta \
+    --where="post_type='product'" > /tmp/product_restore.sql
+mysql production_db < /tmp/product_restore.sql
+
+# Invalidate all active sessions
+wp eval 'WP_Session_Tokens::destroy_all_for_all_users();'
+
+
+
+
+
+
+Step 2 — Patched the reward handler with correct capability check and a strict allowlist:
+
+
+// referral-plugin/plugin.php — Secure replacement
+
+add_action('wp_ajax_claim_referral_reward', function() {
+
+    // 1. Verify nonce — prevents CSRF
+    check_ajax_referer('referral_claim_nonce', 'nonce');
+
+    // 2. Correct minimum capability — 'read' is the true subscriber baseline
+    if (!is_user_logged_in()) {
+        wp_send_json_error(['message' => 'Not logged in'], 401);
+    }
+
+    // 3. Strict allowlist of permitted reward types — never use user input in do_action()
+    $allowed_reward_types = [
+        'discount_coupon',
+        'bonus_points',
+        'free_shipping',
+    ];
+
+    $reward_type = sanitize_text_field($_POST['reward_type'] ?? '');
+
+    if (!in_array($reward_type, $allowed_reward_types, true)) {
+        error_log(sprintf(
+            '[PRIV ESC ATTEMPT] user=%d ip=%s reward_type=%s',
+            get_current_user_id(),
+            $_SERVER['REMOTE_ADDR'],
+            $reward_type
+        ));
+        wp_send_json_error(['message' => 'Invalid reward type'], 400);
+    }
+
+
+    $user_id = get_current_user_id();
+
+    // 4. Call specific named functions — never pass user input to do_action()
+    switch ($reward_type) {
+        case 'discount_coupon':
+            $result = referral_grant_coupon($user_id);
+            break;
+        case 'bonus_points':
+            $result = referral_grant_points($user_id);
+            break;
+        case 'free_shipping':
+            $result = referral_grant_free_shipping($user_id);
+            break;
+        default:
+            wp_send_json_error(['message' => 'Unhandled type'], 500);
+            return;
+    }
+
+    wp_send_json_success(['message' => 'Reward claimed!', 'result' => $result]);
+});
+
+
+
+
+
+
+Step 3 — Added capability gates to all sensitive WooCommerce admin actions:
+
+// functions.php — Enforce capability on every sensitive WooCommerce hook
+
+$wc_sensitive_actions = [
+    'woocommerce_update_payment_gateways' => 'manage_woocommerce',
+    'woocommerce_delete_product'          => 'delete_products',
+    'woocommerce_export_orders'           => 'view_woocommerce_reports',
+    'woocommerce_update_shipping'         => 'manage_woocommerce',
+];
+
+foreach ($wc_sensitive_actions as $action => $required_cap) {
+    add_action('woocommerce_' . $action, function() use ($required_cap, $action) {
+        if (!current_user_can($required_cap)) {
+            error_log(sprintf(
+                '[PRIV ESC BLOCKED] action=%s user=%d(%s) ip=%s',
+                $action,
+                get_current_user_id(),
+                implode(',', wp_get_current_user()->roles),
+                $_SERVER['REMOTE_ADDR']
+            ));
+            wp_die('Access denied.', 'Insufficient Permissions', ['response' => 403]);
+        }
+    }, 1); // Priority 1 — fires before the action executes
+}
+
+
+
+
+
+
+Step 4 — Audited all AJAX handlers for over-permissive capability checks:
+
+// audit-ajax-caps.php — Run via: wp eval-file audit-ajax-caps.php
+// Lists all nopriv (unauthenticated) AJAX handlers for manual review
+
+
+global $wp_filter;
+$nopriv_hooks = array_keys(
+    array_filter($wp_filter, fn($key) => strpos($key, 'wp_ajax_nopriv_') === 0, ARRAY_FILTER_USE_KEY)
+);
+
+
+echo count($nopriv_hooks) . " unauthenticated AJAX handlers:\n\n";
+foreach ($nopriv_hooks as $hook) {
+    $action = str_replace('wp_ajax_nopriv_', '', $hook);
+    echo "Action: {$action}\n";
+    echo "Review: Verify this should be accessible without login\n\n";
+}
+
+
+
+
+
+
+
+Step 5 — Deployed a real-time privilege escalation monitor:
+
+// mu-plugins/priv-monitor.php — Alert on suspicious capability usage by low-priv users
+
+add_action('init', function() {
+    if (!is_user_logged_in()) return;
+
+    $user             = wp_get_current_user();
+    $low_priv_roles   = ['subscriber', 'customer'];
+    $sensitive_caps   = ['manage_options', 'manage_woocommerce', 'delete_users', 'edit_plugins'];
+
+    if (empty(array_intersect($low_priv_roles, (array) $user->roles))) return;
+
+    // Alert if a low-priv user is sending requests containing admin capability names
+    foreach ($sensitive_caps as $cap) {
+        if (isset($_POST[$cap]) || isset($_GET[$cap])) {
+            error_log(sprintf(
+                '[PRIV ESC ATTEMPT] user=%s(%d) role=%s cap=%s ip=%s uri=%s',
+                $user->user_login, $user->ID,
+                implode(',', (array) $user->roles),
+                $cap,
+                $_SERVER['REMOTE_ADDR'],
+                $_SERVER['REQUEST_URI']
+            ));
+            wp_mail(
+                get_option('admin_email'),
+                '🚨 Privilege Escalation Attempt — ' . $user->user_login,
+                "User: {$user->user_login} (ID: {$user->ID})\n" .
+                "Role: " . implode(', ', (array) $user->roles) . "\n" .
+                "Attempted: {$cap}\n" .
+                "IP: {$_SERVER['REMOTE_ADDR']}\n" .
+                "URI: {$_SERVER['REQUEST_URI']}\n" .
+                "Time: " . current_time('mysql')
+            );
+        }
+    }
+}, 99);
+
+
+
+
+
+
+
+
+All 340 deleted products were fully restored from backup. PayPal credentials rotated. A full audit of every AJAX handler across all 12 active plugins found 4 additional handlers with over-permissive capability checks — all patched within the same working day. 
+
+
+
+
+
+
+
+
+
+
+
+Main Cause:
+
+
+What we Did:

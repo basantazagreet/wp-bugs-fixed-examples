@@ -1,0 +1,218 @@
+Bug Title / Short Description (one liner) : "We mapped custom domains to our sub-sites but they all redirect back to the main site"
+Bug category: Multisite Network
+
+Description:
+A franchise business client was running a WordPress Multisite network where each franchise location had its own sub-site (network.com/location-chicago/, network.com/location-miami/). They had purchased individual domain names for each location (chicago.franchisebrand.com, miami.franchisebrand.com) and were using a domain mapping plugin to point those custom domains to the respective sub-sites. After a WordPress core update to 6.5, every mapped domain started redirecting to the main network site instead of the correct sub-site.
+
+
+
+
+Main Cause:
+WordPress 6.5 introduced changes to how home_url() and site_url() behave within Multisite network context. The domain mapping plugin was using a deprecated filter ms_site_check that was removed in 6.5, which it relied on to intercept requests for mapped domains and reroute them to the correct blog ID before WordPress's own URL resolution ran. Without this filter, WordPress couldn't match the incoming request domain to a sub-site and fell back to serving the main site for all unrecognised domains.
+
+
+
+
+
+What We Did :
+
+
+Step 1 — Confirmed the domain mapping failure path:
+
+
+# Test each mapped domain to confirm redirect destination
+for domain in chicago.franchisebrand.com miami.franchisebrand.com dallas.franchisebrand.com; do
+    echo -n "$domain → "
+    curl -sI "https://$domain/" | grep -E "^location:|^HTTP/"
+done
+
+
+
+# Output:
+# chicago.franchisebrand.com → HTTP/1.1 301 → location: https://network.com/
+# miami.franchisebrand.com   → HTTP/1.1 301 → location: https://network.com/
+
+# All mapped domains redirecting to main site — confirmed
+
+
+
+
+
+
+
+Step 2 — Checked if SUNRISE was set and the sunrise.php drop-in was present:
+
+// Domain mapping requires SUNRISE = true in wp-config.php
+// and a sunrise.php file in wp-content/
+
+// Check wp-config.php
+grep -i 'sunrise' /var/www/html/wp-config.php
+// Result: define('SUNRISE', false);  ← Was set to false — domain mapping disabled
+
+// Check for sunrise.php drop-in
+ls /var/www/html/wp-content/sunrise.php
+// Result: No such file — drop-in was never created
+
+
+
+
+
+
+Step 3 — Updated wp-config.php and created the sunrise.php drop-in:
+
+
+// wp-config.php — Enable sunrise for domain mapping
+define('SUNRISE', true); // Must be true for domain mapping to work
+
+php// wp-content/sunrise.php — Domain mapping bootstrap drop-in
+// This file is loaded very early in WordPress bootstrap, before plugins
+// It maps incoming request domains to the correct blog ID
+
+if (!defined('ABSPATH')) exit;
+
+global $wpdb, $current_blog, $current_site;
+
+// Get the incoming domain from the server
+$domain = strtolower(
+    preg_replace('/:\d+$/', '', $_SERVER['HTTP_HOST']) // Strip port if present
+);
+
+// Look up this domain in the domain mapping table
+$blog = $wpdb->get_row($wpdb->prepare("
+    SELECT blog_id
+    FROM {$wpdb->base_prefix}domain_mapping
+    WHERE domain = %s
+    AND   active = 1
+    LIMIT 1
+", $domain));
+
+if ($blog) {
+    // Switch context to the mapped blog before WordPress continues loading
+    $current_blog = get_blog_details($blog->blog_id);
+
+    if ($current_blog) {
+        $current_blog->domain = $domain; // Override domain to the mapped one
+        $wpdb->set_blog_id($current_blog->blog_id, $current_blog->site_id);
+
+        // Force WordPress to use the mapped domain for all URL generation
+        define('COOKIE_DOMAIN', $domain);
+        define('COOKIEPATH', '/');
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+Step 4 — Rebuilt the domain mapping table after verifying the plugin's table was intact:
+
+sql-- Verify domain mapping table exists and has correct data
+DESCRIBE wp_domain_mapping;
+
+-- Check current mappings
+SELECT dm.blog_id, dm.domain, dm.active, b.domain AS original_domain, b.path
+FROM wp_domain_mapping dm
+JOIN wp_blogs b ON dm.blog_id = b.blog_id
+ORDER BY dm.blog_id;
+
+-- If table was corrupted or missing, recreate it
+CREATE TABLE IF NOT EXISTS wp_domain_mapping (
+    id      BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+    blog_id BIGINT(20) UNSIGNED NOT NULL DEFAULT 0,
+    domain  VARCHAR(255)        NOT NULL DEFAULT '',
+    active  TINYINT(4)          NOT NULL DEFAULT 1,
+    PRIMARY KEY (id),
+    KEY domain  (domain),
+    KEY blog_id (blog_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Re-insert mappings if needed
+INSERT INTO wp_domain_mapping (blog_id, domain, active) VALUES
+    (2, 'chicago.franchisebrand.com', 1),
+    (3, 'miami.franchisebrand.com',   1),
+    (4, 'dallas.franchisebrand.com',  1);
+    
+    
+    
+    
+    
+    
+    
+Step 5 — Added mapped domain URL filters so internal WordPress URL generation uses the correct domain:
+
+// functions.php (network-level) — Ensure mapped domains are used in URL generation
+
+// Override home_url() and site_url() to return the mapped domain
+add_filter('home_url', function($url, $path, $scheme, $blog_id) {
+    if (!$blog_id) $blog_id = get_current_blog_id();
+
+    global $wpdb;
+    $mapped = $wpdb->get_var($wpdb->prepare("
+        SELECT domain FROM {$wpdb->base_prefix}domain_mapping
+        WHERE blog_id = %d AND active = 1
+        LIMIT 1
+    ", $blog_id));
+
+    if ($mapped) {
+        $url = ($scheme ?: 'https') . '://' . $mapped . $path;
+    }
+
+    return $url;
+}, 10, 4);
+
+// Fix redirect_canonical to not strip mapped domains
+add_filter('redirect_canonical', function($redirect_url, $requested_url) {
+    $host = parse_url($requested_url, PHP_URL_HOST);
+    global $wpdb;
+    $is_mapped = $wpdb->get_var($wpdb->prepare("
+        SELECT COUNT(*) FROM {$wpdb->base_prefix}domain_mapping
+        WHERE domain = %s AND active = 1
+    ", $host));
+
+    // Don't redirect away from a legitimately mapped domain
+    if ($is_mapped) {
+        return false;
+    }
+    return $redirect_url;
+}, 10, 2);
+
+
+
+
+
+
+
+Step 6 — Added SSL wildcard verification for all mapped domains:
+
+# Verify SSL certificates are valid for all mapped domains
+for domain in chicago.franchisebrand.com miami.franchisebrand.com dallas.franchisebrand.com; do
+    echo -n "$domain SSL: "
+    echo | openssl s_client -servername "$domain" -connect "$domain:443" 2>/dev/null \
+        | openssl x509 -noout -dates 2>/dev/null \
+        | grep notAfter
+done
+
+# Set up auto-renewal with Certbot for all mapped domains
+certbot certonly --webroot -w /var/www/html \
+    -d chicago.franchisebrand.com \
+    -d miami.franchisebrand.com \
+    -d dallas.franchisebrand.com \
+    --non-interactive --agree-tos --email admin@franchisebrand.com
+    
+
+
+    
+All 14 franchise domain mappings were restored and working within 2 hours. A pre-update staging test was established to catch plugin/core compatibility breaks before they reach the live network. 
+
+
+
+
+
+
+

@@ -1,0 +1,305 @@
+Bug Title / Short Description (one liner) : "Our Arabic site layout is completely broken — text is mixed up and buttons are on the wrong side"
+Bug category: Internationalization & Localization (i18n/l10n)
+
+
+Description: 
+A Middle Eastern media client had launched an Arabic-language WordPress site. Arabic is an RTL (Right-to-Left) language, and the site should display with the layout mirrored — text right-aligned, navigation on the right, sidebars on the left, and UI elements flowing right-to-left. Instead, the site rendered as a chaotic mix: some elements were correctly mirrored, others were still LTR, text was overlapping, buttons appeared on the wrong side of forms, and the mobile menu was completely unusable.
+
+
+
+
+Main Cause:
+Four issues were compounding to break RTL rendering:
+
+The theme was loading a custom stylesheet without checking text direction — its style.css had no RTL counterpart (rtl.css), so all LTR-specific CSS rules (floats, margins, paddings, text-align) applied unchanged to the RTL layout.
+A JavaScript slider plugin was hardcoded with direction: 'ltr' in its initialisation options, making it scroll left-to-right regardless of the page direction.
+Several inline styles in the page builder blocks used hardcoded margin-left and padding-left instead of logical properties (margin-inline-start), which do not flip in RTL mode.
+The <html> tag was missing the dir="rtl" attribute — WordPress sets this via language_attributes() but the theme's header.php was using a hardcoded <html lang="ar"> without dir.
+
+
+
+
+What We Did:
+
+
+
+Step 1 — Fixed the <html> tag to include proper direction attribute:
+
+php// header.php — BEFORE: hardcoded, missing dir attribute
+<html lang="ar">
+
+// header.php — AFTER: WordPress-managed, includes dir="rtl" automatically
+<html <?php language_attributes(); ?>>
+// language_attributes() outputs: lang="ar" dir="rtl" when locale is Arabic
+
+
+
+
+
+Step 2 — Created a comprehensive rtl.css for the theme:
+
+css/* wp-content/themes/client-theme/rtl.css
+   WordPress automatically enqueues this file when is_rtl() returns true
+   It should OVERRIDE or RESET all LTR-specific CSS rules */
+
+/* ─── Global Direction Resets ─── */
+body {
+    direction: rtl;
+    text-align: right;
+}
+
+/* ─── Navigation ─── */
+.main-nav,
+.nav-menu {
+    /* Flip the menu item order */
+    flex-direction: row-reverse;
+}
+
+.nav-menu li ul {
+    /* Submenu opens to the left in RTL */
+    left: auto;
+    right: 0;
+}
+
+.menu-toggle {
+    /* Hamburger icon on the left in RTL */
+    left: 20px;
+    right: auto;
+}
+
+/* ─── Sidebar ─── */
+.widget-area {
+    /* Sidebar moves to the left side in RTL */
+    float: left;
+    margin-left: 0;
+    margin-right: 30px;
+}
+
+.site-content .entry-content {
+    float: right;
+    margin-right: 0;
+    margin-left: 30px;
+}
+
+/* ─── Forms ─── */
+input[type="text"],
+input[type="email"],
+input[type="search"],
+textarea {
+    direction: rtl;
+    text-align: right;
+}
+
+/* Submit buttons align to the right in RTL forms */
+.form-submit,
+.comment-form .submit {
+    text-align: right;
+}
+
+/* ─── Comments ─── */
+.comment-body {
+    margin-left: 0;
+    margin-right: 80px; /* Avatar is on the right in RTL */
+}
+
+.comment-meta .avatar {
+    float: right;
+    margin-left: 15px;
+    margin-right: 0;
+}
+
+/* ─── Breadcrumbs ─── */
+.breadcrumb-separator {
+    /* Flip the arrow direction */
+    transform: scaleX(-1);
+}
+
+/* ─── Pagination ─── */
+.nav-previous {
+    float: right;
+}
+.nav-next {
+    float: left;
+}
+
+/* ─── Admin Bar — fix for RTL ─── */
+#wpadminbar {
+    direction: rtl;
+}
+
+/* ─── Use CSS logical properties where possible ─── */
+/* These automatically flip in RTL without needing rtl.css overrides */
+.card {
+    margin-inline-start: 0;     /* replaces margin-left */
+    margin-inline-end: 20px;    /* replaces margin-right */
+    padding-inline-start: 15px; /* replaces padding-left */
+    border-inline-start: 3px solid #c0392b; /* replaces border-left */
+}
+
+
+
+
+
+
+
+Step 3 — Enqueued the RTL stylesheet correctly in WordPress:
+
+php// functions.php — RTL stylesheet loading
+add_action('wp_enqueue_scripts', function() {
+    wp_enqueue_style(
+        'client-theme-style',
+        get_stylesheet_uri(),
+        [],
+        wp_get_theme()->get('Version')
+    );
+
+    // WordPress automatically loads rtl.css when is_rtl() is true
+    // IF the style is registered with a matching handle + '-rtl' suffix
+    // But for the main stylesheet we explicitly check:
+    if (is_rtl()) {
+        $rtl_file = get_template_directory() . '/rtl.css';
+        if (file_exists($rtl_file)) {
+            wp_enqueue_style(
+                'client-theme-rtl',
+                get_template_directory_uri() . '/rtl.css',
+                ['client-theme-style'],
+                wp_get_theme()->get('Version')
+            );
+        }
+    }
+});
+
+// Also add RTL body class for JavaScript hooks
+add_filter('body_class', function($classes) {
+    if (is_rtl()) {
+        $classes[] = 'rtl';
+        $classes[] = 'direction-rtl';
+    }
+    return $classes;
+});
+
+
+
+
+
+
+Step 4 — Fixed the LTR-hardcoded JavaScript slider:
+
+javascript// assets/js/slider-init.js — RTL-aware slider initialisation
+
+document.addEventListener('DOMContentLoaded', function() {
+    // Detect RTL from the document direction attribute
+    const isRTL = document.documentElement.dir === 'rtl' ||
+                  document.body.classList.contains('rtl');
+
+    // Initialise slider with direction awareness
+    const slider = new Swiper('.hero-slider', {
+        // Flip slider direction for RTL layouts
+        dir: isRTL ? 'rtl' : 'ltr',
+
+        // Reverse navigation arrow meaning in RTL
+        navigation: {
+            nextEl: '.swiper-button-next',
+            prevEl: '.swiper-button-prev',
+        },
+
+        // Autoplay direction
+        autoplay: {
+            delay: 5000,
+            reverseDirection: isRTL, // Slides move right-to-left in RTL
+        },
+
+        // Keyboard: arrow keys flip in RTL
+        keyboard: {
+            enabled: true,
+        },
+
+        on: {
+            init: function() {
+                if (isRTL) {
+                    // Flip navigation arrow icons for RTL
+                    document.querySelectorAll('.swiper-button-next, .swiper-button-prev')
+                        .forEach(el => el.style.transform = 'scaleX(-1)');
+                }
+            }
+        }
+    });
+});
+
+
+
+
+
+
+Step 5 — Added an RTL compatibility scanner for page builder blocks:
+
+// functions.php — Detect hardcoded LTR-specific inline styles in post content
+add_action('the_content', function($content) {
+    if (!is_rtl() || !current_user_can('edit_posts') || !WP_DEBUG) return $content;
+
+    // Flag LTR-specific inline styles that won't flip in RTL
+    $ltr_patterns = [
+        '/style=["\'][^"\']*(?:float:\s*left|text-align:\s*left|margin-left:[^;]+)[^"\']*["\']/i',
+        '/style=["\'][^"\']*padding-left\s*:[^"\']*["\']/i',
+    ];
+
+    foreach ($ltr_patterns as $pattern) {
+        if (preg_match($pattern, $content)) {
+            error_log('RTL Warning: Post ' . get_the_ID() .
+                      ' contains hardcoded LTR CSS that may not flip correctly in RTL layout.');
+        }
+    }
+
+    return $content;
+});
+
+
+
+
+
+
+Step 6 — Tested RTL rendering across all page types using an automated check:
+
+// rtl-audit.php — Run via: wp eval-file rtl-audit.php
+echo "RTL Configuration Audit\n";
+echo str_repeat('=', 40) . "\n\n";
+
+echo "Locale: "        . get_locale()                        . "\n";
+echo "Is RTL: "        . (is_rtl() ? 'YES ✅' : 'NO ❌')     . "\n";
+echo "Text direction: " . (is_rtl() ? 'rtl' : 'ltr')         . "\n\n";
+
+// Check for rtl.css
+$rtl_css = get_template_directory() . '/rtl.css';
+echo "rtl.css exists: " . (file_exists($rtl_css) ? 'YES ✅' : 'MISSING ❌') . "\n";
+
+// Check language_attributes() output
+ob_start();
+language_attributes();
+$lang_attrs = ob_get_clean();
+echo "language_attributes(): $lang_attrs\n";
+$has_dir = strpos($lang_attrs, 'dir=') !== false;
+echo "dir attribute present: " . ($has_dir ? 'YES ✅' : 'MISSING ❌') . "\n\n";
+
+// Check loaded translation files
+global $l10n;
+$loaded_domains = array_keys($l10n ?? []);
+echo "Loaded text domains (" . count($loaded_domains) . "):\n";
+foreach ($loaded_domains as $domain) {
+    echo "  - $domain\n";
+}
+
+
+
+
+
+
+
+
+The Arabic site rendered correctly in full RTL mode after the fixes. Mobile menu, sliders, forms, sidebars, and navigation all flowed right-to-left. The client confirmed the layout matched their design mockups exactly. 
+
+
+
+
+
+
+

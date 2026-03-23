@@ -1,0 +1,266 @@
+Bug Title / Short Description (one liner) : "Our hosting company upgraded PHP and now half our plugins show a white screen"
+Bug category: Updates & Upgrade System 
+
+
+Description: 
+A long-standing WordPress site client contacted us after their managed hosting provider silently upgraded the server from PHP 7.4 to PHP 8.2 as part of a "platform modernisation" rollout. The hosting provider gave no advance notice. Immediately after the upgrade, the site showed a white screen on the frontend and a different fatal error in wp-admin for every page attempted. The client had approximately 23 active plugins, many of which had not been updated in 1–2 years.
+
+
+
+
+
+Main Cause:
+PHP 8.2 introduced several breaking changes compared to PHP 7.4, including:
+
+Deprecated ${var} string interpolation → fatal in 8.2
+null passed to non-nullable parameters now throws TypeError (previously just a warning)
+Dynamic properties on undeclared class properties now emit deprecation notices that — with WP_DEBUG_DISPLAY = true — broke page rendering
+Several functions removed: create_function(), each(), money_format() — all used by older plugins
+
+Six plugins were using one or more of these deprecated/removed patterns, and two of them were loading early enough in the WordPress bootstrap that their fatal errors prevented the entire site from loading.
+
+
+
+
+
+
+
+What We Did:
+
+Step 1 — Enabled error logging and disabled display to get readable errors without breaking the page output:
+
+// wp-config.php — Capture all PHP 8.2 errors to log file
+define('WP_DEBUG',         true);
+define('WP_DEBUG_LOG',     true);
+define('WP_DEBUG_DISPLAY', false); // Never output to screen — breaks HTML
+error_reporting(E_ALL);
+ini_set('log_errors', 'On');
+ini_set('error_log', WP_CONTENT_DIR . '/debug.log');
+
+
+
+
+
+Step 2 — Used WP-CLI to identify which plugins were causing fatals:
+
+# Deactivate all plugins — confirms if WP core itself runs under PHP 8.2
+wp plugin deactivate --all --skip-plugins --skip-themes
+
+# Check if core loads clean
+wp eval 'echo PHP_VERSION;' --skip-plugins --skip-themes
+# Output: 8.2.12 — core is fine
+
+# Reactivate one by one and test
+wp plugin list --fields=name,status --format=csv | tail -n +2 | while IFS=, read name status; do
+    wp plugin activate "$name" --skip-themes 2>&1
+    result=$(wp eval 'echo "OK";' --skip-themes 2>&1)
+    if [[ "$result" != "OK" ]]; then
+        echo "FATAL: $name"
+        wp plugin deactivate "$name" --skip-themes
+    else
+        echo "OK: $name"
+    fi
+done
+
+
+
+
+
+
+
+
+
+
+Step 3 — Fixed the most critical PHP 8.2 incompatibilities across the failing plugins:
+
+// Fix 1 — Deprecated string interpolation ${var} → {$var}
+
+// BEFORE (PHP 8.2 deprecated/fatal):
+$query = "SELECT * FROM ${table} WHERE id = ${id}";
+
+// AFTER (correct syntax):
+$query = "SELECT * FROM {$table} WHERE id = {$id}";
+
+// -------------------------------------------------------
+
+// Fix 2 — null passed to non-nullable parameters
+
+// BEFORE (TypeError in PHP 8.0+):
+function format_price($amount) {
+    return number_format($amount, 2); // Fatals if $amount is null
+}
+
+// AFTER (null-safe with default):
+function format_price(?float $amount): string {
+    if ($amount === null) return '0.00';
+    return number_format($amount, 2);
+}
+
+// -------------------------------------------------------
+
+// Fix 3 — Removed function create_function()
+
+// BEFORE (removed in PHP 8.0):
+$callback = create_function('$x', 'return $x * 2;');
+
+// AFTER (modern anonymous function):
+$callback = fn($x) => $x * 2;
+
+// -------------------------------------------------------
+
+// Fix 4 — Removed function each()
+
+// BEFORE (removed in PHP 8.0):
+reset($array);
+while (list($key, $value) = each($array)) {
+    echo "$key: $value\n";
+}
+
+// AFTER:
+foreach ($array as $key => $value) {
+    echo "$key: $value\n";
+}
+
+// -------------------------------------------------------
+
+// Fix 5 — Dynamic properties on undeclared class properties (PHP 8.2 deprecation)
+
+// BEFORE (deprecation warning in PHP 8.2 — causes output before headers if displayed):
+class PluginSettings {
+    // No property declarations
+}
+$settings = new PluginSettings();
+$settings->api_key = 'abc123'; // Dynamic property — deprecated
+
+// AFTER — declare all properties:
+class PluginSettings {
+    public string $api_key   = '';
+    public bool   $enabled   = false;
+    public array  $config    = [];
+
+    // Or use the #[AllowDynamicProperties] attribute for legacy compatibility:
+    // #[AllowDynamicProperties]
+    // class PluginSettings { ... }
+}
+
+
+
+
+
+
+
+
+
+Step 4 — Created a PHP compatibility scanner to catch issues before the next PHP upgrade:
+
+// php-compat-scanner.php — Run via: wp eval-file php-compat-scanner.php
+// Scans all active plugin files for known PHP 8.x incompatible patterns
+
+$plugin_dir = WP_PLUGIN_DIR;
+$plugins    = get_option('active_plugins', []);
+$issues     = [];
+
+// Patterns that are fatal or deprecated in PHP 8.x
+$danger_patterns = [
+    '/\$\{[a-zA-Z_]\w*\}/'                    => 'Deprecated string interpolation ${var} — use {$var}',
+    '/\bcreate_function\s*\(/'                 => 'create_function() removed in PHP 8.0',
+    '/\beach\s*\(/'                            => 'each() removed in PHP 8.0',
+    '/\bmoney_format\s*\(/'                    => 'money_format() removed in PHP 8.0',
+    '/\bsettype\s*\([^,]+,\s*["\']null["\']\)/' => 'settype to null behavior changed in PHP 8',
+    '/\bReflectionParameter::getClass\(\)/'    => 'getClass() deprecated in PHP 8.0',
+    '/\bSplFileInfo::getExtension\(\)/'        => 'May behave differently on PHP 8.2',
+];
+
+foreach ($plugins as $plugin_file) {
+    $plugin_path = $plugin_dir . '/' . dirname($plugin_file);
+    $php_files   = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($plugin_path, FilesystemIterator::SKIP_DOTS)
+    );
+
+    foreach ($php_files as $file) {
+        if ($file->getExtension() !== 'php') continue;
+
+        $content   = file_get_contents($file->getRealPath());
+        $rel_path  = str_replace($plugin_dir . '/', '', $file->getRealPath());
+
+        foreach ($danger_patterns as $pattern => $description) {
+            if (preg_match($pattern, $content, $match)) {
+                $issues[] = [
+                    'plugin'  => dirname($plugin_file),
+                    'file'    => $rel_path,
+                    'issue'   => $description,
+                    'match'   => substr($match[0], 0, 60),
+                ];
+            }
+        }
+    }
+}
+
+if (empty($issues)) {
+    echo "No PHP 8.x compatibility issues found.\n";
+} else {
+    echo count($issues) . " potential issues found:\n\n";
+    $current_plugin = '';
+    foreach ($issues as $issue) {
+        if ($issue['plugin'] !== $current_plugin) {
+            echo "\n📦 Plugin: {$issue['plugin']}\n";
+            $current_plugin = $issue['plugin'];
+        }
+        echo "   File:  {$issue['file']}\n";
+        echo "   Issue: {$issue['issue']}\n";
+        echo "   Match: {$issue['match']}\n\n";
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+Step 5 — Implemented a PHP version staging gate to block future unannounced PHP upgrades from affecting production:
+
+// wp-content/mu-plugins/php-version-gate.php
+// Checks PHP version on every request and alerts if it changes unexpectedly
+
+$stored_php = get_option('expected_php_version', PHP_VERSION);
+
+if (version_compare(PHP_VERSION, $stored_php, '!=')) {
+    // PHP version has changed since last check
+    $message = sprintf(
+        "PHP version changed on %s!\n\nPrevious: %s\nCurrent:  %s\n\n" .
+        "Run compatibility checks immediately:\n%s",
+        home_url(),
+        $stored_php,
+        PHP_VERSION,
+        admin_url('admin.php?page=php-compat-check')
+    );
+
+    wp_mail(
+        get_option('admin_email'),
+        '🚨 PHP Version Changed — Compatibility Check Required',
+        $message
+    );
+
+    // Update stored version so we don't spam alerts
+    update_option('expected_php_version', PHP_VERSION);
+    error_log("PHP version change detected: $stored_php → " . PHP_VERSION);
+}
+
+
+
+
+
+
+All 23 plugins were either patched, replaced with maintained alternatives, or wrapped with compatibility shims. Site was fully operational on PHP 8.2 within 6 hours. 
+
+
+
+
+

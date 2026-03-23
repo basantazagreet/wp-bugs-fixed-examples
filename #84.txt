@@ -1,0 +1,174 @@
+Bug Title / Short Description (one liner) :"Our server logs show millions of xmlrpc.php hits — site is barely responding"
+Bug category: REST API & XML-RPC
+
+
+
+
+Description: 
+A long-running WordPress blog client contacted us in a panic — their site had slowed to a near-complete halt, the hosting provider had threatened account suspension for excessive resource usage, and server logs showed millions of POST requests to xmlrpc.php from hundreds of rotating IP addresses. They were under an active distributed XML-RPC brute force attack — a botnet hammering the endpoint using system.multicall, which allows testing thousands of password combinations in a single HTTP request.
+
+
+
+
+Main Cause:
+The xmlrpc.php endpoint was fully exposed with no rate limiting, no IP restriction, and system.multicall enabled. A single multicall request can test 500+ username/password combinations in one HTTP call — making it exponentially more efficient than a standard login brute force. The botnet was sending approximately 2,000 requests per minute from rotating IPs, each one bootstrapping WordPress fully and consuming significant CPU and memory.
+
+
+
+
+
+What We Did:
+
+
+
+Step 1 — Immediate server-level block via Nginx to stop all attack traffic before PHP is invoked:
+
+# /etc/nginx/sites-available/client-site.conf
+# Block xmlrpc.php at the server level — zero PHP overhead
+
+location = /xmlrpc.php {
+    deny all;
+    return 444; # 444 = Nginx closes connection without response — wastes attacker resources
+}
+This dropped server CPU from 94% to 12% within 2 minutes — without touching WordPress at all.
+
+
+
+
+
+Step 2 — Disabled XML-RPC within WordPress as a defense-in-depth layer:
+
+// functions.php — Disable XML-RPC entirely within WordPress
+add_filter('xmlrpc_enabled', '__return_false');
+
+// Stop advertising xmlrpc.php location in HTML head
+remove_action('wp_head', 'rsd_link');
+remove_action('wp_head', 'wlwmanifest_link');
+
+// Remove X-Pingback header so the endpoint location isn't revealed
+add_filter('wp_headers', function($headers) {
+    unset($headers['X-Pingback']);
+    return $headers;
+});
+
+
+
+
+Step 3 — Disabled system.multicall specifically for sites that legitimately need XML-RPC:
+
+// functions.php — Remove only the dangerous multicall method
+// Use this approach instead of full disable when mobile apps need XML-RPC
+add_filter('xmlrpc_methods', function($methods) {
+
+    // system.multicall allows batching hundreds of auth attempts per request
+    // This single method is responsible for the vast majority of WP brute force attacks
+    
+    unset($methods['system.multicall']);
+    unset($methods['system.listMethods']);    // Don't advertise available methods
+    unset($methods['system.getCapabilities']); // Don't expose capability map
+
+    return $methods;
+});
+
+
+
+
+
+
+Step 4 — Deployed fail2ban rules to auto-ban attacking IPs at the firewall level:
+
+# /etc/fail2ban/filter.d/wordpress-xmlrpc.conf
+
+[Definition]
+failregex = ^<HOST> .* "POST /xmlrpc.php
+ignoreregex =
+ini# /etc/fail2ban/jail.local
+[wordpress-xmlrpc]
+enabled  = true
+port     = http,https
+filter   = wordpress-xmlrpc
+logpath  = /var/log/nginx/access.log
+maxretry = 5
+bantime  = 86400    ; 24-hour ban per IP
+findtime = 60       ; 5 hits within 60 seconds triggers the ban
+
+
+
+
+
+Step 5 — Added WordPress-level rate limiting on all authentication entry points:
+
+// functions.php — Rate limit all login attempts across REST, XML-RPC, and wp-login
+add_filter('authenticate', function($user, $username, $password) {
+    if (empty($username) || empty($password)) {
+        return $user;
+    }
+
+    $ip           = $_SERVER['REMOTE_ADDR'];
+    $cache_key    = 'login_attempts_' . md5($ip);
+    $attempts     = (int) get_transient($cache_key);
+    $max_attempts = 10;
+    $lockout_time = 15 * MINUTE_IN_SECONDS;
+
+    if ($attempts >= $max_attempts) {
+        return new WP_Error(
+            'too_many_attempts',
+            sprintf(
+                'Too many login attempts. Please try again in %d minutes.',
+                ceil($lockout_time / 60)
+            )
+        );
+    }
+
+    set_transient($cache_key, $attempts + 1, $lockout_time);
+    return $user;
+}, 30, 3);
+
+// Clear counter on successful login
+add_action('wp_login', function($user_login) {
+    $ip        = $_SERVER['REMOTE_ADDR'];
+    $cache_key = 'login_attempts_' . md5($ip);
+    delete_transient($cache_key);
+});
+
+
+
+
+
+
+Step 6 — Set up a daily monitoring alert for unusual xmlrpc.php traffic spikes:
+
+// functions.php — Alert admin when xmlrpc.php traffic exceeds threshold
+add_action('daily_security_audit', function() {
+    $log_file  = '/var/log/nginx/access.log';
+    $threshold = 1000; // Alert if more than 1000 POST hits in 24h
+
+    if (!file_exists($log_file)) return;
+
+    $count = (int) trim(shell_exec("grep 'POST /xmlrpc.php' $log_file | wc -l"));
+
+    if ($count > $threshold) {
+        wp_mail(
+            get_option('admin_email'),
+            '🚨 XML-RPC Abuse Alert — ' . number_format($count) . ' POST requests today',
+            "Site: " . home_url() . "\n\n" .
+            "Received {$count} POST requests to xmlrpc.php in the last 24 hours.\n\n" .
+            "Immediate review recommended. Consider blocking xmlrpc.php at the server level.\n"
+        );
+    }
+});
+
+if (!wp_next_scheduled('daily_security_audit')) {
+    wp_schedule_event(time(), 'daily', 'daily_security_audit');
+}
+
+
+
+
+Server load dropped from 94% to under 8% within 5 minutes of the Nginx block. The botnet traffic was completely nullified. The client's hosting account was saved from suspension, and the site has had zero XML-RPC incidents in the 14 months since. 
+
+
+
+
+
+

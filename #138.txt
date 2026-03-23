@@ -1,0 +1,277 @@
+Bug Title / Short Description (one liner) :  "Settings keep randomly resetting to defaults — different editors see different values"
+Bug category: Core Settings & Options API
+
+
+Description:
+A multi-author media platform reported that plugin settings were randomly resetting throughout the day. One editor would configure the site's featured post limit to 12, come back an hour later to find it set to 6. Another would enable a content filter, return to find it disabled. Strangely, different users logged in simultaneously seemed to see different values for the same settings. The issue was intermittent and impossible to reproduce reliably — until it started affecting published content.
+
+
+
+
+
+Main Cause:
+A race condition in the Options API was identified. The site ran behind a load balancer with 3 PHP-FPM workers and was using no persistent object cache. A custom settings plugin was using a read-modify-write pattern with get_option() followed by update_option() — with several seconds of processing between them. When two workers processed simultaneous requests, they would both read the old value, both modify it independently, and the last write would silently overwrite the first — causing settings to appear to "reset" unpredictably.
+
+// The vulnerable read-modify-write pattern in the settings plugin:
+
+
+add_action('wp_ajax_save_content_settings', function() {
+    // Worker 1 and Worker 2 both execute this simultaneously:
+
+    $settings = get_option('content_plugin_settings', []); // Both read the same old value
+
+    // Worker 1 sets featured_limit = 12
+    // Worker 2 sets featured_limit = 6 (from a different user's form submission)
+    $settings['featured_limit'] = intval($_POST['featured_limit']);
+
+    sleep(2); // Simulates processing delay — during which the race window is open
+
+    update_option('content_plugin_settings', $settings);
+    // Last write wins — whichever worker reaches this line second overwrites the other
+});
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Confirmed the race condition using database write timestamps:
+
+
+# Enable general query log temporarily to see concurrent writes
+
+SET GLOBAL general_log = 'ON';
+SET GLOBAL general_log_file = '/var/log/mysql/general.log';
+
+-- After reproducing the issue, check the log for near-simultaneous UPDATE statements
+-- on the same option_name
+
+grep "UPDATE.*wp_options.*content_plugin_settings" /var/log/mysql/general.log | tail -20
+
+-- Confirmed: two UPDATE statements within 80ms of each other on the same row
+
+
+
+
+
+
+Step 2 — Implemented database-level locking using MySQL's GET_LOCK() to prevent concurrent writes:
+
+
+// functions.php — Mutex lock for options that cannot be written concurrently
+function options_mutex_lock($lock_name, $timeout = 10) {
+    global $wpdb;
+    $result = $wpdb->get_var($wpdb->prepare(
+        "SELECT GET_LOCK(%s, %d)",
+        'wp_option_lock_' . $lock_name,
+        $timeout
+    ));
+    return $result === '1';
+}
+
+function options_mutex_unlock($lock_name) {
+    global $wpdb;
+    $wpdb->query($wpdb->prepare(
+        "SELECT RELEASE_LOCK(%s)",
+        'wp_option_lock_' . $lock_name
+    ));
+}
+
+// Usage — wrap any read-modify-write operation in a mutex
+add_action('wp_ajax_save_content_settings', function() {
+    check_ajax_referer('save_content_settings_nonce', 'nonce');
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error('Insufficient permissions.', 403);
+    }
+
+    $lock_name = 'content_plugin_settings';
+
+    // Acquire exclusive lock — only one PHP process can hold this at a time
+    if (!options_mutex_lock($lock_name, 5)) {
+        wp_send_json_error([
+            'message' => 'Settings are being updated by another user. Please try again.'
+        ], 409); // 409 Conflict
+    }
+
+    try {
+        // Re-read INSIDE the lock to get the most current value
+        $settings = get_option('content_plugin_settings', []);
+
+        // Apply changes
+        if (isset($_POST['featured_limit'])) {
+            $settings['featured_limit'] = absint($_POST['featured_limit']);
+        }
+        if (isset($_POST['content_filter'])) {
+            $settings['content_filter'] = (bool) $_POST['content_filter'];
+        }
+        if (isset($_POST['post_types'])) {
+            $settings['post_types'] = array_map(
+                'sanitize_key',
+                (array) $_POST['post_types']
+            );
+        }
+
+        $updated = update_option('content_plugin_settings', $settings);
+
+        // Log who changed what for audit trail
+        error_log(sprintf(
+            'Settings updated: user=%d changed=%s time=%s',
+            get_current_user_id(),
+            wp_json_encode(array_keys($_POST)),
+            current_time('mysql')
+        ));
+
+        wp_send_json_success([
+            'message'  => 'Settings saved.',
+            'settings' => $settings,
+        ]);
+
+    } finally {
+        // ALWAYS release the lock — even if an exception occurs
+        options_mutex_unlock($lock_name);
+    }
+});
+
+
+
+
+
+
+
+
+
+Step 3 — Installed Redis as a persistent object cache to ensure all workers share the same option values:
+
+# Install Redis and the WordPress Redis object cache drop-in
+sudo apt-get install redis-server php-redis
+
+# Install the Redis object cache plugin
+wp plugin install redis-cache --activate
+
+# Configure Redis connection in wp-config.php
+// wp-config.php — Redis object cache configuration
+define('WP_REDIS_HOST',     '127.0.0.1');
+define('WP_REDIS_PORT',     6379);
+define('WP_REDIS_TIMEOUT',  1);
+define('WP_REDIS_DATABASE', 0);
+define('WP_REDIS_PREFIX',   'clientsite_');
+
+// Enable the object cache drop-in
+// wp redis enable  ← Run via WP-CLI after adding config
+
+
+
+
+
+
+
+
+
+Step 4 — Refactored the settings storage to use individual options per setting instead of one large merged array:
+
+// functions.php — Store each setting independently to eliminate merge conflicts
+// Individual options eliminate the read-modify-write race entirely for single-value changes
+
+class Content_Plugin_Settings {
+
+    // Getters — each reads its own option with no merging needed
+    public static function get_featured_limit() {
+        return absint(get_option('cp_featured_limit', 6));
+    }
+
+    public static function get_content_filter() {
+        return (bool) get_option('cp_content_filter', false);
+    }
+
+    public static function get_post_types() {
+        return (array) get_option('cp_post_types', ['post']);
+    }
+
+    // Setters — each atomic update_option() call cannot race with others
+    public static function set_featured_limit($value) {
+        return update_option('cp_featured_limit', absint($value));
+    }
+
+    public static function set_content_filter($value) {
+        return update_option('cp_content_filter', (bool) $value);
+    }
+
+    public static function set_post_types(array $types) {
+        return update_option('cp_post_types', array_map('sanitize_key', $types));
+    }
+}
+
+// Usage — atomic updates, no race condition possible for independent settings
+Content_Plugin_Settings::set_featured_limit(12);  // Only touches cp_featured_limit
+Content_Plugin_Settings::set_content_filter(true); // Only touches cp_content_filter
+
+
+
+
+
+
+
+
+Step 5 — Added a settings change audit log viewer in the admin for transparency:
+
+// functions.php — Log and display recent settings changes in admin
+add_action('update_option', function($option, $old_value, $new_value) {
+    // Only track our plugin's options
+    if (strpos($option, 'cp_') !== 0 && $option !== 'content_plugin_settings') return;
+
+    global $wpdb;
+    $wpdb->insert(
+        $wpdb->prefix . 'settings_audit_log',
+        [
+            'option_name' => $option,
+            'old_value'   => maybe_serialize($old_value),
+            'new_value'   => maybe_serialize($new_value),
+            'changed_by'  => get_current_user_id(),
+            'changed_at'  => current_time('mysql'),
+            'ip_address'  => $_SERVER['REMOTE_ADDR'],
+        ],
+        ['%s', '%s', '%s', '%d', '%s', '%s']
+    );
+}, 10, 3);
+
+// Create the audit log table on plugin activation
+register_activation_hook(__FILE__, function() {
+    global $wpdb;
+    $wpdb->query("
+        CREATE TABLE IF NOT EXISTS {$wpdb->prefix}settings_audit_log (
+            id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            option_name VARCHAR(191)    NOT NULL,
+            old_value   LONGTEXT,
+            new_value   LONGTEXT,
+            changed_by  BIGINT UNSIGNED,
+            changed_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            ip_address  VARCHAR(45),
+            PRIMARY KEY (id),
+            KEY idx_option  (option_name),
+            KEY idx_changed (changed_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+});
+
+
+
+
+
+
+
+Settings became fully stable and deterministic after installing Redis and refactoring to atomic individual options. The audit log immediately revealed that the "random resets" had actually been caused by two legitimate users submitting the settings form simultaneously — now they see a clear conflict message instead of silent overwrites. 
+
+
+
+
+
+
+ 
+
+
+Main Cause:
+
+
+What we Did:

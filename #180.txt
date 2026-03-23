@@ -1,0 +1,205 @@
+Bug Title / Short Description (one liner) :  "WordPress updated itself at 2pm on a weekday and the site was down for 40 minutes during our busiest hour"
+Bug category: Updates & Upgrade System 
+
+
+
+Description:
+A high-traffic e-commerce client contacted us furious — WordPress had auto-updated itself from 6.4.2 to 6.4.3 at 2:17 PM on a Tuesday, their highest-traffic window of the week. During the update, WordPress entered maintenance mode (.maintenance file placed in root), which displayed the "Briefly unavailable for scheduled maintenance" message to all visitors for 40 minutes. The update itself took only 90 seconds — but the .maintenance file was never cleaned up due to a PHP timeout mid-update, leaving the site in a permanent maintenance loop that required manual intervention to resolve.
+
+
+
+
+Main Cause:
+Two compounding issues:
+
+Auto-updates were enabled without a maintenance window strategy — WordPress's default auto-update behavior fires at an unpredictable time driven by WP-Cron, which is triggered by site visits. With high traffic, WP-Cron fires frequently and the update happened to trigger during peak hours.
+The PHP execution time limit was set to 30 seconds on the server. The update process — which involved downloading the package, verifying checksums, extracting files, and running upgrade routines — exceeded this limit on a slow shared host connection, causing PHP to die mid-update. WordPress places the .maintenance file at the very start of the update process and removes it at the very end — a PHP timeout meant the removal step never ran.
+
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Immediately removed the stuck .maintenance file:
+
+bash# The .maintenance file lives in WordPress root (same level as wp-config.php)
+ls -la /var/www/html/.maintenance
+# -rw-r--r-- 1 www-data www-data 27 Nov 14 14:17 .maintenance
+
+# Remove it — site immediately becomes accessible again
+rm /var/www/html/.maintenance
+
+# Verify site is back
+curl -I https://clientsite.com
+# HTTP/2 200 ← Back online
+
+
+
+
+
+Step 2 — Took full control of the auto-update schedule by disabling WordPress's unpredictable default and replacing it with a scheduled maintenance window:
+
+// wp-config.php — Disable all automatic updates entirely
+// We will manage updates manually on a schedule
+define('AUTOMATIC_UPDATER_DISABLED', true);
+
+// Or more granularly — disable only core auto-updates but keep security patches
+define('WP_AUTO_UPDATE_CORE', 'minor'); // 'minor' = security/minor only, false = none
+
+
+// functions.php — Replace random WP-Cron update timing with a fixed maintenance window
+// Schedule updates to run at 2 AM on Sunday — lowest traffic window
+
+// Disable WordPress's own auto-update scheduling
+add_filter('auto_update_core',   '__return_false');
+add_filter('auto_update_plugin', '__return_false');
+add_filter('auto_update_theme',  '__return_false');
+
+// Schedule our own controlled update window
+add_action('wp', function() {
+    if (!wp_next_scheduled('controlled_update_check')) {
+        // Schedule for next Sunday at 2 AM server time
+        $next_sunday_2am = strtotime('next sunday 02:00:00');
+        wp_schedule_event($next_sunday_2am, 'weekly', 'controlled_update_check');
+    }
+});
+
+add_action('controlled_update_check', function() {
+    // Only proceed during our maintenance window (Sunday 1 AM – 4 AM)
+    $hour      = (int) date('H');
+    $day       = date('l');
+    $in_window = ($day === 'Sunday' && $hour >= 1 && $hour < 4);
+
+    if (!$in_window) {
+        error_log('Controlled update: outside maintenance window, skipping.');
+        return;
+    }
+
+    // Notify admin that update is starting
+    wp_mail(
+        get_option('admin_email'),
+        '🔄 Scheduled WordPress Update Starting',
+        "Controlled update check starting at " . current_time('mysql') . "\n" .
+        "Site: " . home_url() . "\n\n" .
+        "If the site is unreachable after 4 AM, check for stuck .maintenance file."
+    );
+
+    // Run the update
+    require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+    $upgrader = new WP_Automatic_Updater();
+    $upgrader->run();
+});
+
+
+
+
+
+
+
+
+Step 3 — Added a .maintenance file watchdog that auto-removes it if it's been present for more than 10 minutes:
+
+
+// wp-content/mu-plugins/maintenance-watchdog.php
+// Runs on every request — removes stuck .maintenance file if update is not in progress
+
+add_action('init', function() {
+    $maintenance_file = ABSPATH . '.maintenance';
+
+    if (!file_exists($maintenance_file)) return;
+
+    $file_age_seconds = time() - filemtime($maintenance_file);
+    $max_age_seconds  = 10 * MINUTE_IN_SECONDS; // 10 minute max
+
+    if ($file_age_seconds > $max_age_seconds) {
+        // Check if an update is genuinely in progress
+        $updating = get_transient('update_in_progress');
+        if (!$updating) {
+            unlink($maintenance_file);
+            error_log('Maintenance watchdog: removed stuck .maintenance file after ' .
+                round($file_age_seconds / 60, 1) . ' minutes.');
+            wp_mail(
+                get_option('admin_email'),
+                '⚠️ Stuck Maintenance File Removed Automatically',
+                "A .maintenance file was found and removed after being present for " .
+                round($file_age_seconds / 60, 1) . " minutes.\n\n" .
+                "This may indicate a failed update. Please verify your site is fully operational."
+            );
+        }
+    }
+});
+
+
+
+
+
+
+
+Step 4 — Increased PHP execution limits to prevent mid-update timeouts:
+
+ini; php.ini — Ensure update process has enough time and memory
+max_execution_time = 300   ; 5 minutes — sufficient for any WP update
+memory_limit       = 256M
+max_input_time     = 300
+
+php// wp-config.php — Override PHP limits for WordPress update context
+@set_time_limit(300);
+@ini_set('memory_limit', '256M');
+
+
+
+
+
+
+
+Step 5 — Built a pre-update snapshot system that captures a restore point before any update runs:
+
+// functions.php — Create restore snapshot before every update
+add_filter('upgrader_pre_install', function($response, $hook_extra) {
+    $timestamp   = date('Y-m-d_H-i-s');
+    $backup_dir  = WP_CONTENT_DIR . '/backups/';
+
+    if (!is_dir($backup_dir)) mkdir($backup_dir, 0755, true);
+
+    // Database snapshot
+    $db_backup = $backup_dir . "db_pre_update_{$timestamp}.sql";
+    $command   = sprintf(
+        'mysqldump --user=%s --password=%s --host=%s %s > %s 2>/dev/null',
+        escapeshellarg(DB_USER),
+        escapeshellarg(DB_PASSWORD),
+        escapeshellarg(DB_HOST),
+        escapeshellarg(DB_NAME),
+        escapeshellarg($db_backup)
+    );
+    shell_exec($command);
+
+    if (file_exists($db_backup) && filesize($db_backup) > 1000) {
+        error_log("Pre-update DB snapshot: $db_backup (" . filesize($db_backup) . " bytes)");
+        set_transient('last_db_backup', $db_backup, DAY_IN_SECONDS);
+    }
+
+    // Log what is being updated
+    $type = $hook_extra['type'] ?? 'unknown';
+    $slug = $hook_extra['plugin'] ?? $hook_extra['theme'] ?? 'core';
+    error_log("Update starting: type={$type} slug={$slug} time={$timestamp}");
+
+    return $response;
+}, 10, 2);
+
+
+
+
+
+
+
+
+The client went from random mid-day updates to a predictable Sunday 2 AM maintenance window. Zero unplanned downtime in the 8 months since. 
+
+
+
+
+
+

@@ -1,0 +1,20 @@
+Bug Title / Short Description (one liner)  :  Client's users are getting logged out every few minutes
+Bug category: Authentication & User Management
+Description: An e-commerce client reported that customers were being randomly logged out mid-session, killing their checkout flow and causing lost sales.
+
+
+Main cause: The hosting server was running multiple PHP processes with no shared session storage. Each request could hit a different process, invalidating the session token.
+
+
+What we Did:
+We Forced WordPress to use the database for session/auth token storage instead of relying on server-side PHP sessions, and extended the auth cookie lifetime:
+
+
+// functions.php — Extend login session to 30 days for "remember me"
+
+add_filter('auth_cookie_expiration', function($expire, $user_id, $remember) {
+    return $remember ? (30 * DAY_IN_SECONDS) : (2 * DAY_IN_SECONDS);
+}, 10, 3);
+
+
+We also installed Redis Object Cache to unify session handling across all PHP workers, which permanently resolved the logout loop.

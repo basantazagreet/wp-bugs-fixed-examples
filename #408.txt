@@ -1,0 +1,220 @@
+Bug Title / Short Description (one liner) :  "We set the site language to French but everything is still showing in English"
+Bug category: Internationalization & Localization (i18n/l10n)
+
+
+Description: 
+A Canadian client running a bilingual WordPress site had set Settings → General → Site Language to Français (France) and expected the WordPress admin interface and frontend theme strings to render in French. After the language switch, the frontend still displayed all WordPress default strings (like "Leave a Reply", "Filed Under", "Posted on") in English, and the wp-admin interface remained entirely in English. The client had also purchased a French translation for their premium theme which appeared to have no effect.
+
+
+
+
+
+Main Cause:
+Three separate issues were preventing translations from loading:
+
+The languages directory (wp-content/languages/) was missing entirely — it had been accidentally excluded during the site migration. WordPress downloads .mo translation files into this directory, and without it, all translation lookups silently fell back to English.
+The theme's French translation .mo file was placed in the wrong directory (wp-content/themes/client-theme/lang/ instead of the required wp-content/themes/client-theme/languages/) and the theme's load_theme_textdomain() call pointed to neither location — it used a hardcoded dirname(__FILE__) . '/i18n/' path that didn't exist at all.
+The WPLANG constant in an old wp-config.php section was explicitly set to an empty string define('WPLANG', '') — a legacy override that was forcing English regardless of what the Settings panel showed.
+
+
+
+
+
+
+
+What We Did:
+
+
+
+Step 1 — Diagnosed all three issues:
+
+bash# Check if languages directory exists and has correct permissions
+ls -la /var/www/html/wp-content/languages/
+# ls: cannot access: No such file or directory ← Missing entirely
+
+# Check WPLANG constant
+grep -n 'WPLANG' /var/www/html/wp-config.php
+# Line 47: define('WPLANG', '');  ← Forcing English
+
+# Check theme text domain loading
+grep -rn 'load_theme_textdomain\|load_plugin_textdomain' \
+    /var/www/html/wp-content/themes/client-theme/functions.php
+# Found: load_theme_textdomain('client-theme', get_template_directory() . '/i18n/');
+# But /i18n/ directory does not exist — translations never load
+
+# Verify what locale WordPress thinks it's using
+wp eval 'echo get_locale();'
+# Output: en_US  ← Stuck in English due to WPLANG override
+
+
+
+
+
+
+Step 2 — Fixed the wp-config.php WPLANG override:
+
+php// wp-config.php — BEFORE (forcing English)
+define('WPLANG', ''); // Legacy constant — overrides Settings panel language choice
+
+// wp-config.php — AFTER (removed, or set correctly)
+// Option A: Remove the define entirely — let WordPress use Settings → General → Site Language
+// define('WPLANG', '');  ← Deleted
+
+// Option B: Set it explicitly to the desired locale
+define('WPLANG', 'fr_FR'); // Français (France)
+
+// Note: In modern WordPress (3.0+), the WPLANG constant is deprecated
+// The correct way is Settings → General → Site Language
+// But if WPLANG is defined, it takes absolute priority over the Settings panel
+
+
+
+
+
+
+Step 3 — Created the missing languages directory and downloaded translations:
+
+bash# Create the languages directory structure
+
+mkdir -p /var/www/html/wp-content/languages/themes/
+mkdir -p /var/www/html/wp-content/languages/plugins/
+chown -R www-data:www-data /var/www/html/wp-content/languages/
+chmod 755 /var/www/html/wp-content/languages/
+
+# Download WordPress core French translations via WP-CLI
+wp language core install fr_FR --activate
+
+# Download translations for all active plugins
+wp language plugin install --all fr_FR
+
+# Download translations for all active themes
+wp language theme install --all fr_FR
+
+# Verify translations were downloaded
+ls /var/www/html/wp-content/languages/
+# Should now show: fr_FR.mo, fr_FR.po, plugins/, themes/
+
+
+
+
+
+
+
+
+Step 4 — Fixed the theme's text domain loading:
+
+// functions.php — Correct theme translation loading
+
+// BEFORE — Broken: wrong directory path
+add_action('after_setup_theme', function() {
+    load_theme_textdomain(
+        'client-theme',
+        get_template_directory() . '/i18n/' // Directory doesn't exist
+    );
+});
+
+// AFTER — Fixed: correct directory + fallback chain
+add_action('after_setup_theme', function() {
+    // WordPress looks for: wp-content/languages/themes/client-theme-fr_FR.mo
+    // This is the PREFERRED location — managed by WordPress language packs
+    $loaded = load_theme_textdomain('client-theme');
+
+    // Fallback: check theme's own languages directory
+    if (!$loaded) {
+        $loaded = load_theme_textdomain(
+            'client-theme',
+            get_template_directory() . '/languages/'
+        );
+    }
+
+    // Last resort: check the old /lang/ directory (for manually placed files)
+    if (!$loaded) {
+        load_theme_textdomain(
+            'client-theme',
+            get_template_directory() . '/lang/'
+        );
+    }
+});
+
+
+
+
+
+
+Step 5 — Placed the purchased French .mo file correctly and verified it loaded:
+
+
+bash# WordPress looks for theme translations in this exact path:
+
+# wp-content/languages/themes/{textdomain}-{locale}.mo
+# Example: wp-content/languages/themes/client-theme-fr_FR.mo
+
+# Copy the purchased translation file to the correct location
+cp /tmp/client-theme-fr_FR.mo \
+   /var/www/html/wp-content/languages/themes/client-theme-fr_FR.mo
+cp /tmp/client-theme-fr_FR.po \
+   /var/www/html/wp-content/languages/themes/client-theme-fr_FR.po
+
+# Verify the .mo file is valid and not corrupted
+wp eval '
+$mofile = WP_CONTENT_DIR . "/languages/themes/client-theme-fr_FR.mo";
+$mo = new MO();
+if ($mo->import_from_file($mofile)) {
+    echo "✅ .mo file valid. Entries loaded: " . count($mo->entries) . "\n";
+} else {
+    echo "❌ .mo file invalid or corrupted.\n";
+}
+'
+
+
+
+
+
+Step 6 — Added a translation health check to the admin dashboard:
+
+
+// functions.php — Diagnose translation loading issues
+
+add_action('admin_notices', function() {
+    if (!current_user_can('manage_options')) return;
+    if (get_locale() === 'en_US') return; // Only show for non-English locales
+
+    $locale          = get_locale();
+    $mo_file         = WP_LANG_DIR . "/$locale.mo";
+    $theme_mo        = WP_LANG_DIR . '/themes/' . get_stylesheet() . "-$locale.mo";
+    $issues          = [];
+
+    if (!file_exists($mo_file)) {
+        $issues[] = "Core translation file missing: <code>$mo_file</code>";
+    }
+    if (!file_exists($theme_mo)) {
+        $issues[] = "Theme translation file missing: <code>$theme_mo</code> — " .
+                    "<a href='" . esc_url(admin_url('update-core.php?action=do-translation-upgrade')) .
+                    "'>Download translations</a>";
+    }
+
+    if (!empty($issues)) {
+        echo '<div class="notice notice-warning"><p>';
+        echo '<strong>Translation Issues Detected:</strong><ul>';
+        foreach ($issues as $issue) {
+            echo "<li>$issue</li>";
+        }
+        echo '</ul></p></div>';
+    }
+});
+
+
+
+
+
+
+
+The WordPress admin immediately switched to French after removing the WPLANG override. All frontend theme strings translated correctly once the .mo file was in the right location. 
+
+
+
+
+
+
+
+

@@ -1,0 +1,158 @@
+Bug Title / Short Description (one liner) :  "Every time we upload an image it just says 'HTTP Error' — nothing else"
+Bug category: Media & File Management
+
+
+Description: 
+A photography studio client reported that image uploads had completely stopped working across all browsers and for all users. Dragging an image into the media uploader or using the "Add Media" button both resulted in a vague "HTTP Error" message with no additional detail. The uploads had been working fine the previous week with no changes made by the client.
+
+
+
+Main Cause:
+Two issues were found operating together:
+
+The hosting provider had silently lowered the PHP memory limit from 256MB to 64MB during a server rebalancing event. WordPress's image processing library (GD or Imagick) requires significant memory to resize large images — the studio's RAW-exported JPEGs were averaging 18–25MB each, which caused PHP to hit the memory ceiling mid-upload and die with no useful error surfaced to the browser.
+The uploads directory had its file permissions changed to 644 (read-only for the web server user) as a side effect of a cPanel auto-hardening script, preventing WordPress from writing new files.
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Enabled detailed upload error logging to expose the real failure:
+
+// functions.php — Capture and log all upload errors with full context
+add_filter('wp_handle_upload_error', function($error, $file) {
+    error_log('Upload error: ' . $error->get_error_message());
+    error_log('Upload file: ' . print_r($file, true));
+    error_log('Memory usage: ' . memory_get_peak_usage(true) / 1024 / 1024 . 'MB');
+    error_log('Memory limit: ' . ini_get('memory_limit'));
+    return $error;
+}, 10, 2);
+
+
+Log revealed:
+Upload error: Allowed memory size of 67108864 bytes exhausted
+Memory usage: 63.8MB
+Memory limit: 64M
+
+
+
+
+
+
+Step 2 — Fixed PHP memory limits at multiple levels for redundancy:
+
+
+// wp-config.php — Force memory limit before WordPress loads
+
+define('WP_MEMORY_LIMIT', '256M');
+define('WP_MAX_MEMORY_LIMIT', '512M'); // For admin operations like bulk uploads
+
+ini; php.ini — Server-level fix (preferred)
+memory_limit       = 256M
+upload_max_filesize = 64M
+post_max_size       = 64M
+max_execution_time  = 300
+max_input_time      = 300
+apache# .htaccess — Fallback if php.ini is not editable
+php_value memory_limit       256M
+php_value upload_max_filesize 64M
+php_value post_max_size       64M
+
+
+
+
+
+
+Step 3 — Fixed the uploads directory permissions:
+
+# Correct permissions for WordPress uploads directory
+# Directories: 755 (rwxr-xr-x)
+# Files: 644 (rw-r--r--)
+find /var/www/html/wp-content/uploads -type d -exec chmod 755 {} \;
+find /var/www/html/wp-content/uploads -type f -exec chmod 644 {} \;
+
+
+# Verify web server user owns the uploads directory
+chown -R www-data:www-data /var/www/html/wp-content/uploads
+
+
+# Confirm WordPress can write to uploads
+wp eval 'var_dump(wp_is_writable(wp_upload_dir()["basedir"]));'
+
+# Should output: bool(true)
+
+
+
+
+
+Step 4 — Added a pre-upload memory check to surface actionable errors before the upload fails silently:
+
+
+// functions.php — Warn if memory is too low before attempting image upload
+
+add_filter('wp_handle_upload_prefilter', function($file) {
+    $memory_limit    = wp_convert_hr_to_bytes(ini_get('memory_limit'));
+    $file_size       = $file['size'];
+    // GD/Imagick typically needs ~5x the file size in memory to process
+    $required_memory = $file_size * 5;
+
+    if ($required_memory > ($memory_limit * 0.8)) {
+        $required_mb = round($required_memory / 1024 / 1024);
+        $current_mb  = round($memory_limit / 1024 / 1024);
+        $file['error'] = sprintf(
+            'This file requires approximately %dMB of memory to process, but only %dMB is available. ' .
+            'Please resize the image before uploading, or contact your host to increase PHP memory.',
+            $required_mb,
+            $current_mb
+        );
+    }
+
+    return $file;
+});
+
+
+
+
+
+Step 5 — Set up a server resource monitor that alerts before limits are silently lowered again:
+
+// functions.php — Weekly resource limit check
+
+
+add_action('wp_resource_limit_check', function() {
+    $memory_limit = wp_convert_hr_to_bytes(ini_get('memory_limit'));
+    $upload_limit = wp_convert_hr_to_bytes(ini_get('upload_max_filesize'));
+    $issues       = [];
+
+    if ($memory_limit < wp_convert_hr_to_bytes('128M')) {
+        $issues[] = 'PHP memory_limit is below 128MB: ' . ini_get('memory_limit');
+    }
+    if ($upload_limit < wp_convert_hr_to_bytes('16M')) {
+        $issues[] = 'PHP upload_max_filesize is below 16MB: ' . ini_get('upload_max_filesize');
+    }
+
+    if (!empty($issues)) {
+        wp_mail(
+            get_option('admin_email'),
+            '⚠️ WordPress Server Resource Limits Too Low',
+            implode("\n", $issues)
+        );
+    }
+});
+
+if (!wp_next_scheduled('wp_resource_limit_check')) {
+    wp_schedule_event(time(), 'weekly', 'wp_resource_limit_check');
+}
+
+
+
+
+All uploads resumed immediately. The studio client was also advised to export JPEGs at 72dpi for web rather than uploading RAW-quality files, reducing average upload size from 22MB to under 3MB. 
+
+
+
+
+

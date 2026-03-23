@@ -1,0 +1,230 @@
+Bug Title / Short Description (one liner) : "Our custom post type archive page always returns 404 — the single posts work fine"
+Bug category: Permalinks & URL Routing
+
+
+Description: 
+A real estate agency client had a custom post type property registered by their theme. Individual property pages (e.g., clientsite.com/property/beachfront-villa/) loaded perfectly. But the archive page (clientsite.com/properties/) — which should list all properties — always returned a 404. The archive page had never worked since the site launched 3 months prior and the previous developer had given up debugging it.
+
+
+
+
+Main Cause:
+Two separate issues were found:
+
+The custom post type was registered with 'has_archive' => false — meaning WordPress never registered a rewrite rule for the archive URL at all. The archive slug properties had nowhere to route to.
+Even after fixing that, the rewrite rules in the database were stale — WordPress caches its rewrite rules in wp_options under the key rewrite_rules. The stale cache still had no entry for properties/ even after the code fix, because nobody had flushed the rewrite rules.
+
+// The broken post type registration found in the theme:
+register_post_type('property', [
+    'label'       => 'Properties',
+    'public'      => true,
+    'has_archive' => false, // ← This is why the archive 404s — intentionally disabled
+    'rewrite'     => ['slug' => 'property'],
+    'supports'    => ['title', 'editor', 'thumbnail'],
+]);
+
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Confirmed the rewrite rule was absent:
+
+// Temporary debug — dump all registered rewrite rules
+add_action('init', function() {
+    if (!isset($_GET['debug_rewrites']) || !current_user_can('manage_options')) return;
+
+    global $wp_rewrite;
+    $rules = $wp_rewrite->wp_rewrite_rules();
+
+    // Check if any rule matches the archive slug
+    $property_rules = array_filter(
+        array_keys($rules),
+        fn($pattern) => strpos($pattern, 'properties') !== false
+    );
+
+    echo '<pre>';
+    if (empty($property_rules)) {
+        echo "NO rewrite rules found for 'properties' — archive is not registered.\n";
+    } else {
+        echo "Rules matching 'properties':\n";
+        print_r($property_rules);
+    }
+    echo '</pre>';
+    exit;
+});
+
+// Visit: https://clientsite.com/?debug_rewrites=1
+
+
+
+
+
+Step 2 — Fixed the post type registration with correct archive and rewrite configuration:
+
+// functions.php — Corrected custom post type registration
+
+add_action('init', function() {
+    $labels = [
+        'name'               => 'Properties',
+        'singular_name'      => 'Property',
+        'menu_name'          => 'Properties',
+        'add_new'            => 'Add Property',
+        'add_new_item'       => 'Add New Property',
+        'edit_item'          => 'Edit Property',
+        'view_item'          => 'View Property',
+        'all_items'          => 'All Properties',
+        'search_items'       => 'Search Properties',
+        'not_found'          => 'No properties found.',
+        'not_found_in_trash' => 'No properties found in Trash.',
+    ];
+
+    register_post_type('property', [
+        'labels'              => $labels,
+        'public'              => true,
+        'publicly_queryable'  => true,
+        'show_ui'             => true,
+        'show_in_menu'        => true,
+        'show_in_rest'        => true,   // Enables Gutenberg support
+        'has_archive'         => 'properties', // ✅ Archive enabled with custom slug
+        'rewrite'             => [
+            'slug'       => 'property',        // Single post slug: /property/beach-villa/
+            'with_front' => false,             // Don't prepend the front base
+            'feeds'      => true,              // Enable RSS feed for archive
+            'pages'      => true,              // Enable pagination on archive
+        ],
+        'supports'            => ['title', 'editor', 'thumbnail', 'excerpt', 'custom-fields'],
+        'menu_position'       => 5,
+        'menu_icon'           => 'dashicons-building',
+        'capability_type'     => 'post',
+        'hierarchical'        => false,
+        'query_var'           => true,
+    ]);
+});
+
+
+
+
+
+Step 3 — Flushed rewrite rules after the code change:
+
+# Always flush rewrite rules after ANY post type registration change
+wp rewrite flush --hard
+
+# Verify the archive rule now exists
+wp eval '
+global $wp_rewrite;
+$rules = $wp_rewrite->wp_rewrite_rules();
+$found = array_filter(array_keys($rules), fn($p) => strpos($p, "properties") !== false);
+echo empty($found) ? "Archive rule MISSING\n" : "Archive rule found: " . implode(", ", $found) . "\n";
+'
+
+
+
+
+
+Step 4 — Created the archive template so WordPress has something to render:
+
+php// wp-content/themes/client-theme/archive-property.php
+// WordPress template hierarchy: archive-{post_type}.php
+
+<?php get_header(); ?>
+
+<main class="property-archive">
+    <header class="archive-header">
+        <h1 class="archive-title">
+            <?php
+            // post_type_archive_title() returns the post type label
+            echo esc_html(post_type_archive_title('', false));
+            ?>
+        </h1>
+        <?php
+        // Display archive description if set via wp_insert_term or edit-tags.php
+        $archive_description = get_the_archive_description();
+        if ($archive_description) {
+            echo '<div class="archive-description">' . wp_kses_post($archive_description) . '</div>';
+        }
+        ?>
+    </header>
+
+    <?php if (have_posts()) : ?>
+        <div class="property-grid">
+            <?php while (have_posts()) : the_post(); ?>
+                <article id="property-<?php the_ID(); ?>" <?php post_class('property-card'); ?>>
+                    <?php if (has_post_thumbnail()) : ?>
+                        <a href="<?php the_permalink(); ?>">
+                            <?php the_post_thumbnail('medium_large', ['class' => 'property-image']); ?>
+                        </a>
+                    <?php endif; ?>
+
+                    <div class="property-details">
+                        <h2 class="property-title">
+                            <a href="<?php the_permalink(); ?>"><?php the_title(); ?></a>
+                        </h2>
+                        <div class="property-meta">
+                            <span class="price"><?php echo esc_html(get_post_meta(get_the_ID(), '_price', true)); ?></span>
+                            <span class="beds"><?php echo esc_html(get_post_meta(get_the_ID(), '_bedrooms', true)); ?> beds</span>
+                        </div>
+                        <?php the_excerpt(); ?>
+                    </div>
+                </article>
+            <?php endwhile; ?>
+        </div>
+
+        <?php the_posts_pagination(['mid_size' => 2]); ?>
+
+    <?php else : ?>
+        <p>No properties found. Check back soon.</p>
+    <?php endif; ?>
+</main>
+
+<?php get_footer(); ?>
+
+
+
+
+
+
+
+Step 5 — Added a rewrite rule integrity checker that fires after any post type registration:
+
+// functions.php — Verify post types with archives have registered rewrite rules
+
+add_action('wp_loaded', function() {
+    if (!current_user_can('manage_options')) return;
+
+    global $wp_post_types, $wp_rewrite;
+    $rules = get_option('rewrite_rules', []);
+
+    foreach ($wp_post_types as $type => $obj) {
+        if (!$obj->has_archive || $type === 'post') continue;
+
+        $archive_slug = is_string($obj->has_archive) ? $obj->has_archive : $type . 's';
+        $has_rule     = false;
+
+        foreach (array_keys($rules) as $pattern) {
+            if (strpos($pattern, $archive_slug) !== false) {
+                $has_rule = true;
+                break;
+            }
+        }
+
+        if (!$has_rule) {
+            error_log("Missing rewrite rule for CPT archive: '{$type}' (slug: '{$archive_slug}'). Run wp rewrite flush.");
+        }
+    }
+});
+
+
+
+
+The properties archive loaded correctly immediately after flushing rewrite rules. The agency also got a template that matched their existing design system. 
+
+
+
+
+
+

@@ -1,0 +1,192 @@
+Bug Title / Short Description (one liner) : "No emails from our WordPress site are arriving anywhere — not even to our own inbox"
+Bug category: Email & Notifications
+
+Description:
+A membership site client reported that zero WordPress emails were being delivered — not password resets, not new user notifications, not WooCommerce order confirmations, not contact form submissions. Users were calling in unable to reset passwords. The problem had been ongoing for approximately 3 weeks before the client realised it wasn't a one-off issue. No bounce messages, no spam folder entries, and no error logs in WordPress — the emails appeared to send successfully from WordPress's perspective.
+
+
+
+Main Cause:
+The site was hosted on a shared hosting plan where the provider had silently disabled PHP's mail() function due to a previous account on the same IP address being used for spam. WordPress's default wp_mail() function relies entirely on PHP's native mail() function when no SMTP plugin is configured. With mail() disabled, WordPress's phpmailer initialised, attempted to send, received a non-fatal error from the disabled function, and continued silently — logging nothing and returning false from wp_mail() which no code was checking.
+
+php// How WordPress sends email by default — single point of failure:
+// wp_mail() → PHPMailer → mail() → [DISABLED ON SERVER] → silent failure
+
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Diagnosed the exact failure point with a direct mail test:
+
+// wp-mail-test.php — Run via: wp eval-file wp-mail-test.php
+// Tests every layer of the email stack
+
+echo "=== WordPress Email Diagnostic ===\n\n";
+
+// Layer 1: Check if PHP mail() function is available
+if (function_exists('mail') && is_callable('mail')) {
+    echo "✅ PHP mail() function: Available\n";
+} else {
+    echo "❌ PHP mail() function: DISABLED — this is likely the root cause\n";
+}
+
+// Layer 2: Test wp_mail() with full error capture
+add_action('wp_mail_failed', function($error) {
+    echo "❌ wp_mail() error: " . $error->get_error_message() . "\n";
+    echo "   Error data: " . print_r($error->get_error_data(), true) . "\n";
+});
+
+$result = wp_mail(
+    get_option('admin_email'),
+    'WordPress Email Test — ' . date('H:i:s'),
+    "This is a test email sent at " . current_time('mysql'),
+    ['Content-Type: text/plain; charset=UTF-8']
+);
+
+echo ($result ? "✅" : "❌") . " wp_mail() returned: " . ($result ? 'true' : 'false') . "\n\n";
+
+// Layer 3: Check PHPMailer configuration
+global $phpmailer;
+if (isset($phpmailer)) {
+    echo "PHPMailer mailer: " . ($phpmailer->Mailer ?? 'not set') . "\n";
+    echo "PHPMailer host: "   . ($phpmailer->Host    ?? 'not set') . "\n";
+    echo "PHPMailer from: "   . ($phpmailer->From    ?? 'not set') . "\n";
+}
+
+
+
+
+
+Step 2 — Configured SMTP to bypass PHP's mail() entirely:
+
+// functions.php — SMTP configuration using Gmail Workspace
+// This replaces PHP mail() with a direct authenticated SMTP connection
+
+add_action('phpmailer_init', function(PHPMailer\PHPMailer\PHPMailer $phpmailer) {
+    $phpmailer->isSMTP();
+    $phpmailer->Host        = 'smtp.gmail.com';
+    $phpmailer->SMTPAuth    = true;
+    $phpmailer->Port        = 587;
+    $phpmailer->SMTPSecure  = PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
+    $phpmailer->Username    = defined('SMTP_USER') ? SMTP_USER : 'noreply@clientsite.com';
+    $phpmailer->Password    = defined('SMTP_PASS') ? SMTP_PASS : '';
+    $phpmailer->From        = defined('SMTP_FROM') ? SMTP_FROM : 'noreply@clientsite.com';
+    $phpmailer->FromName    = defined('SMTP_NAME') ? SMTP_NAME : get_bloginfo('name');
+
+    // Enable SMTP debugging in WP_DEBUG mode
+    if (defined('WP_DEBUG') && WP_DEBUG) {
+        $phpmailer->SMTPDebug  = 2; // 0=off, 1=client, 2=client+server
+        $phpmailer->Debugoutput = function($str, $level) {
+            error_log("PHPMailer [$level]: $str");
+        };
+    }
+});
+
+
+// wp-config.php — Store SMTP credentials outside functions.php
+// Never hardcode credentials in tracked files
+define('SMTP_USER', 'noreply@clientsite.com');
+define('SMTP_PASS', 'your-app-specific-password'); // Gmail app password, NOT account password
+define('SMTP_FROM', 'noreply@clientsite.com');
+define('SMTP_NAME', 'Client Site Name');
+
+
+
+
+
+Step 3 — Added persistent email logging so failures are never silent again:
+
+// functions.php — Log ALL email sends and failures to a dedicated log
+add_action('wp_mail_failed', function(WP_Error $error) {
+    $log_entry = sprintf(
+        "[%s] MAIL FAILED: %s | Data: %s\n",
+        current_time('mysql'),
+        $error->get_error_message(),
+        wp_json_encode($error->get_error_data())
+    );
+    file_put_contents(WP_CONTENT_DIR . '/mail-error.log', $log_entry, FILE_APPEND | LOCK_EX);
+});
+
+// Log successful sends too — for delivery audit trail
+add_filter('wp_mail', function($args) {
+    $log_entry = sprintf(
+        "[%s] MAIL QUEUED: to=%s subject=%s\n",
+        current_time('mysql'),
+        is_array($args['to']) ? implode(',', $args['to']) : $args['to'],
+        $args['subject']
+    );
+    file_put_contents(WP_CONTENT_DIR . '/mail-sent.log', $log_entry, FILE_APPEND | LOCK_EX);
+    return $args;
+});
+
+
+
+
+
+
+Step 4 — Set up SPF, DKIM, and DMARC records to maximise deliverability:
+
+dns; DNS records for clientsite.com — add via hosting DNS panel
+
+; SPF — authorise Google's servers to send mail for this domain
+clientsite.com. IN TXT "v=spf1 include:_spf.google.com ~all"
+
+; DKIM — Google Workspace provides the DKIM key via Admin Console → Gmail → Authenticate email
+; The key looks like this (Google generates it for you):
+google._domainkey.clientsite.com. IN TXT "v=DKIM1; k=rsa; p=MIIBIjANBgkqhk..."
+
+; DMARC — tell receivers what to do with failed SPF/DKIM checks
+_dmarc.clientsite.com. IN TXT "v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@clientsite.com; pct=100"
+
+
+
+
+
+
+
+Step 5 — Added a weekly email system health check:
+
+// functions.php — Weekly automated email delivery test
+add_action('weekly_email_health_check', function() {
+    $test_result = wp_mail(
+        get_option('admin_email'),
+        '✅ Weekly Email Health Check — ' . get_bloginfo('name'),
+        sprintf(
+            "This automated test confirms WordPress email delivery is working.\n\n" .
+            "Site: %s\n" .
+            "Time: %s\n" .
+            "PHP version: %s\n" .
+            "SMTP host: %s\n\n" .
+            "If you receive this email, your email system is healthy.",
+            home_url(),
+            current_time('mysql'),
+            PHP_VERSION,
+            defined('SMTP_HOST') ? SMTP_HOST : 'PHP mail()'
+        )
+    );
+
+    if (!$test_result) {
+        // If even this test fails, send via backup method (e.g. Mailgun API direct)
+        error_log('CRITICAL: Weekly email health check FAILED. Email system may be down.');
+    }
+});
+
+if (!wp_next_scheduled('weekly_email_health_check')) {
+    wp_schedule_event(time(), 'weekly', 'weekly_email_health_check');
+}
+
+
+
+
+
+
+
+All emails began delivering immediately after SMTP configuration. A full 3-week backlog of password reset requests was communicated to affected members via a banner notice directing them to re-request resets. 
+
+
+
+

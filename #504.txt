@@ -1,0 +1,217 @@
+Bug Title / Short Description (one liner) : "Scheduled posts are publishing 5 hours early — our editorial calendar is a mess"
+Bug category: Internationalization & Localization (i18n/l10n)
+
+
+Description: 
+A US-based news publication client reported that scheduled posts were consistently publishing approximately 5 hours before their intended time. A post scheduled to go live at 9:00 AM Eastern was appearing on the site at 4:00 AM Eastern. This had been happening for months and had resulted in several stories breaking before their embargo time, causing editorial and PR problems with sources who had provided exclusive information.
+
+
+
+
+Main Cause:
+The mismatch was exactly 5 hours — precisely the offset between UTC and US Eastern Standard Time (EST, UTC-5). WordPress stores all scheduled post times in UTC internally, but the site's timezone setting in Settings → General was set to UTC instead of America/New_York. When editors scheduled posts using the editor's date picker, they were entering local times (9:00 AM Eastern) which WordPress interpreted as UTC times. The post was then published when the UTC clock hit 9:00 AM — which was 4:00 AM Eastern.
+Additionally, a custom editorial calendar plugin was displaying post times using get_post_time() without specifying $gmt = false, so it was showing UTC times in the calendar as if they were local times — further confusing the editors about when posts were actually scheduled.
+
+
+
+
+
+What We Did:
+
+
+
+Step 1 — Confirmed the timezone misconfiguration:
+
+
+bash# Check current WordPress timezone settings
+wp option get timezone_string
+# Output: '' (empty — no timezone string set, falls back to UTC)
+
+wp option get gmt_offset
+# Output: 0 (UTC offset of 0 — confirming UTC is in use)
+
+# Check what time WordPress thinks it is right now
+wp eval 'echo "UTC time: " . gmdate("Y-m-d H:i:s") . "\n";'
+wp eval 'echo "WP local time: " . current_time("mysql") . "\n";'
+# Both show same time — confirming WP has no timezone offset applied
+
+
+
+
+
+
+Step 2 — Fixed the timezone settings:
+
+
+bash# Set the correct timezone string (preferred over gmt_offset — handles DST automatically)
+wp option update timezone_string 'America/New_York'
+
+# Clear the numeric offset — let the timezone string handle it
+wp option update gmt_offset ''
+
+# Verify the change
+wp eval '
+echo "Timezone string: " . get_option("timezone_string") . "\n";
+echo "GMT offset: " . get_option("gmt_offset") . "\n";
+echo "Current local time: " . current_time("mysql") . "\n";
+echo "Current UTC time: " . current_time("mysql", true) . "\n";
+echo "WP_Timezone: " . wp_timezone()->getName() . "\n";
+'
+
+
+
+
+
+
+Step 3 — Reschedule affected future posts from their incorrectly stored UTC times:
+
+
+
+php// fix-scheduled-post-times.php — Run via: wp eval-file fix-scheduled-post-times.php
+// Shifts all future scheduled posts by the timezone offset to correct the storage
+
+global $wpdb;
+
+// The error: posts were scheduled assuming local time IS UTC
+// Reality: local time is UTC-5 (EST) or UTC-4 (EDT)
+// We need to ADD 5 hours to the stored UTC time to get the correct UTC equivalent
+// of what the editor actually intended
+
+$timezone_offset_hours = 5; // EST = UTC-5, so editor times need +5h to become correct UTC
+
+$scheduled_posts = $wpdb->get_results("
+    SELECT ID, post_title, post_date, post_date_gmt
+    FROM {$wpdb->posts}
+    WHERE post_status = 'future'
+    ORDER BY post_date ASC
+");
+
+echo count($scheduled_posts) . " future posts found.\n\n";
+
+foreach ($scheduled_posts as $post) {
+    // The editor intended: post_date as local time
+    // But it was stored as: post_date = post_date_gmt = entered time (wrong)
+    // Correct UTC = entered time + 5 hours
+    $correct_gmt = date(
+        'Y-m-d H:i:s',
+        strtotime($post->post_date) + ($timezone_offset_hours * HOUR_IN_SECONDS)
+    );
+    $correct_local = date(
+        'Y-m-d H:i:s',
+        strtotime($post->post_date) // Local time stays the same — it was correct all along
+    );
+
+    echo "Post #{$post->ID}: '{$post->post_title}'\n";
+    echo "  Old GMT:     {$post->post_date_gmt}\n";
+    echo "  Correct GMT: $correct_gmt\n";
+    echo "  Local time:  $correct_local (unchanged)\n\n";
+
+    $wpdb->update(
+        $wpdb->posts,
+        [
+            'post_date'     => $correct_local,
+            'post_date_gmt' => $correct_gmt,
+        ],
+        ['ID' => $post->ID],
+        ['%s', '%s'],
+        ['%d']
+    );
+
+    // Re-schedule the WP-Cron event for this post
+    wp_clear_scheduled_hook('publish_future_post', [$post->ID]);
+    wp_schedule_single_event(
+        strtotime($correct_gmt),
+        'publish_future_post',
+        [$post->ID]
+    );
+}
+
+echo "All " . count($scheduled_posts) . " posts rescheduled correctly.\n";
+
+
+
+
+
+
+
+
+
+Step 4 — Fixed the editorial calendar plugin to display times in local timezone:
+
+
+php// editorial-calendar-plugin/calendar.php — Fixed time display
+
+// BEFORE — Shows UTC time as if it were local time:
+$post_time = get_post_time('Y-m-d H:i:s', $gmt = true); // Returns UTC
+echo "Scheduled: $post_time"; // Displays UTC to editor — confusing
+
+// AFTER — Always display times in the site's configured local timezone:
+
+// Option A: Use get_post_time with $gmt = false (returns local time)
+$post_time_local = get_post_time('g:i A', $gmt = false, $post_id);
+echo esc_html(sprintf(
+    /* translators: %s = formatted local time, %s = timezone abbreviation */
+    __('Scheduled: %1$s %2$s', 'editorial-calendar'),
+    $post_time_local,
+    wp_timezone()->getName() // Shows 'America/New_York' for clarity
+));
+
+
+
+// Option B: Use WordPress datetime objects for complex timezone handling
+$post        = get_post($post_id);
+$utc_date    = new DateTimeImmutable($post->post_date_gmt, new DateTimeZone('UTC'));
+$local_date  = $utc_date->setTimezone(wp_timezone());
+echo esc_html($local_date->format('M j, Y g:i A T'));
+// Output: "Jan 15, 2024 9:00 AM EST" — unambiguous for editors
+
+
+
+
+
+
+Step 5 — Added timezone context to all scheduled post displays in the admin:
+
+
+// functions.php — Show timezone context in post scheduling UI
+add_action('post_submitbox_misc_actions', function() {
+    global $post;
+    if ($post->post_status !== 'future' &&
+        !($post->post_status === 'draft' && !empty($post->post_date))) return;
+
+    $timezone_name = wp_timezone()->getName();
+    $utc_offset    = wp_timezone()->getOffset(new DateTime()) / 3600;
+    $offset_label  = $utc_offset >= 0
+        ? "UTC+" . $utc_offset
+        : "UTC"  . $utc_offset;
+
+    echo '<div class="misc-pub-section misc-pub-timezone">';
+    echo '<span class="dashicons dashicons-clock" style="color:#72aee6;"></span> ';
+    printf(
+        '<strong>%s</strong> — All times are in <code>%s</code> (%s)',
+        esc_html__('Timezone', 'your-plugin'),
+        esc_html($timezone_name),
+        esc_html($offset_label)
+    );
+    echo '</div>';
+    echo '<style>.misc-pub-timezone{padding:6px 0;font-size:12px;color:#555;}</style>';
+});
+
+
+
+
+
+All 34 incorrectly scheduled future posts were corrected. The editorial team confirmed posts were now publishing at the exact local times they intended. A timezone banner was added to the scheduling UI so future editors always know which timezone they're working in. 
+
+
+
+
+
+
+
+
+
+
+
+
+

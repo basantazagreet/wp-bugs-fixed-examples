@@ -1,0 +1,231 @@
+Bug Title / Short Description (one liner) : "WooCommerce order confirmation emails are going to our admin inbox instead of the customer"
+Bug category: Email & Notifications
+
+Description: 
+A WooCommerce store client reported that every order confirmation email was landing in the store admin's inbox instead of the customer's. Customers were not receiving any confirmation of their purchase, leading to panic calls and chargebacks from buyers who assumed payment had failed. The admin was simultaneously being flooded with duplicate customer-addressed emails they shouldn't be receiving.
+
+
+
+Main Cause:
+A custom email notification plugin the client had installed to add order tracking updates had a misconfigured wp_mail filter. The filter was intended to CC the admin on all customer emails — but due to a logic error, it was swapping the to and headers arguments, replacing the customer's email address with the admin's in the to field, and placing the customer's address in the Cc header. Mail clients displayed the CC copy in the admin's inbox as the primary recipient, while the customer received nothing.
+
+php// The broken filter found in the notification plugin:
+add_filter('wp_mail', function($args) {
+    $admin_email = get_option('admin_email');
+
+    // INTENTION: CC admin on all outgoing emails
+    // REALITY: This replaces 'to' with admin email and puts customer in CC
+    $args['headers'][] = 'Cc: ' . $args['to']; // Adds customer as CC — correct
+    $args['to']        = $admin_email;          // WRONG — overwrites customer as recipient
+
+    return $args;
+});
+
+
+
+
+
+
+What We Did:
+
+
+
+Step 1 — Confirmed the email routing issue with a wp_mail intercept:
+
+// functions.php — Temporary: log all outgoing email recipient data
+add_filter('wp_mail', function($args) {
+    error_log(sprintf(
+        'wp_mail intercept → to: %s | subject: %s | headers: %s',
+        is_array($args['to']) ? implode(', ', $args['to']) : $args['to'],
+        $args['subject'],
+        is_array($args['headers']) ? implode(' | ', $args['headers']) : $args['headers']
+    ));
+    return $args;
+}, 999); // Priority 999 — run after all other filters to see final state
+
+Log immediately showed to: admin@clientsite.com on every WooCommerce order email.
+
+
+
+
+
+Step 2 — Fixed the plugin's wp_mail filter with correct CC logic:
+
+php// notification-plugin/plugin.php — Fixed email CC logic
+
+// BEFORE — Broken: replaces customer recipient with admin
+add_filter('wp_mail', function($args) {
+    $args['headers'][] = 'Cc: ' . $args['to'];
+    $args['to']        = get_option('admin_email'); // Catastrophic overwrite
+    return $args;
+});
+
+// AFTER — Correct: adds admin as BCC without touching the primary recipient
+add_filter('wp_mail', function($args) {
+    // Only CC admin on WooCommerce order emails — not on every email
+    $woo_subjects = [
+        'New order',
+        'Order on-hold',
+        'Cancelled order',
+        'Processing order',
+        'Completed order',
+    ];
+
+    $is_woo_email = false;
+    foreach ($woo_subjects as $fragment) {
+        if (stripos($args['subject'], $fragment) !== false) {
+            $is_woo_email = true;
+            break;
+        }
+    }
+
+    if ($is_woo_email) {
+        // Use BCC — admin gets a copy but it doesn't affect deliverability for customer
+        if (!is_array($args['headers'])) {
+            $args['headers'] = array_filter(explode("\n", $args['headers']));
+        }
+        $args['headers'][] = 'Bcc: ' . get_option('admin_email');
+        // 'to' is NEVER touched — customer remains the primary recipient
+    }
+
+    return $args;
+}, 10);
+
+
+
+
+
+
+
+Step 3 — Restored the missing customer emails by reprocessing recent affected orders:
+
+php// resend-order-emails.php — Run via: wp eval-file resend-order-emails.php
+// Resends customer-facing order confirmation for all orders in the last 72 hours
+
+$orders = wc_get_orders([
+    'status'      => ['processing', 'completed'],
+    'date_after'  => date('Y-m-d', strtotime('-72 hours')),
+    'limit'       => 200,
+    'return'      => 'objects',
+]);
+
+$wc_emails = WC()->mailer()->get_emails();
+$sent      = 0;
+
+foreach ($orders as $order) {
+    $customer_email = $order->get_billing_email();
+
+    if (empty($customer_email)) {
+        echo "Order #{$order->get_id()}: No customer email — skipping\n";
+        continue;
+    }
+
+    // Resend processing or completed email to customer
+    $email_class = $order->get_status() === 'completed'
+        ? $wc_emails['WC_Email_Customer_Completed_Order']
+        : $wc_emails['WC_Email_Customer_Processing_Order'];
+
+    if ($email_class) {
+        $email_class->trigger($order->get_id(), $order);
+        echo "Order #{$order->get_id()}: Resent to $customer_email\n";
+        $sent++;
+    }
+
+    // Small delay to avoid SMTP rate limits
+    usleep(200000); // 200ms between sends
+}
+
+echo "\nDone. Resent $sent order confirmation emails.\n";
+
+
+
+
+
+
+
+
+
+Step 4 — Added WooCommerce email address validation to catch future routing anomalies:
+
+// functions.php — Validate WooCommerce email recipients before send
+add_filter('woocommerce_email_recipient_customer_processing_order',
+    'validate_woo_email_recipient', 10, 3);
+add_filter('woocommerce_email_recipient_customer_completed_order',
+    'validate_woo_email_recipient', 10, 3);
+add_filter('woocommerce_email_recipient_customer_invoice',
+    'validate_woo_email_recipient', 10, 3);
+
+function validate_woo_email_recipient($recipient, $order, $email_object) {
+    if (!$order instanceof WC_Order) return $recipient;
+
+    $customer_email = $order->get_billing_email();
+    $admin_email    = get_option('admin_email');
+
+    // Alert if a customer email is being sent to the admin address
+    if ($recipient === $admin_email && !empty($customer_email) && $customer_email !== $admin_email) {
+        error_log(sprintf(
+            'WooCommerce email routing anomaly: Order #%d customer email (%s) ' .
+            'is being sent to admin (%s). Correcting recipient.',
+            $order->get_id(),
+            $customer_email,
+            $admin_email
+        ));
+        // Auto-correct to the customer's email
+        return $customer_email;
+    }
+
+    return $recipient;
+}
+
+
+
+
+
+
+
+Step 5 — Added a WooCommerce email routing audit dashboard widget:
+
+// functions.php — Show last 5 WooCommerce email sends in admin dashboard
+add_action('wp_dashboard_setup', function() {
+    if (!current_user_can('manage_woocommerce')) return;
+    wp_add_dashboard_widget(
+        'woo_email_audit',
+        'Recent WooCommerce Email Activity',
+        function() {
+            $log_file = WP_CONTENT_DIR . '/mail-sent.log';
+            if (!file_exists($log_file)) {
+                echo '<p>No email log found. Enable mail logging in functions.php.</p>';
+                return;
+            }
+
+            $lines = array_filter(
+                array_slice(file($log_file), -20),
+                fn($l) => stripos($l, 'order') !== false || stripos($l, 'woocommerce') !== false
+            );
+
+            echo '<ul style="font-family:monospace;font-size:11px;">';
+            foreach (array_slice($lines, -5) as $line) {
+                echo '<li>' . esc_html(trim($line)) . '</li>';
+            }
+            echo '</ul>';
+            echo '<p><a href="' . esc_url(admin_url('admin.php?page=wc-status')) .
+                 '">View WooCommerce Status →</a></p>';
+        }
+    );
+});
+
+
+
+
+
+
+
+
+All customers from the affected 72-hour window received their order confirmations within 30 minutes of the fix. Three chargebacks were successfully reversed with email delivery evidence. 
+
+
+
+
+
+
+

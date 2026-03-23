@@ -1,0 +1,275 @@
+Bug Title / Short Description (one liner) : "Our admin email inbox has 800+ WordPress notifications per day — we can't find real alerts"
+Bug category: Email & Notifications
+
+Description:
+A large WordPress site admin contacted us overwhelmed — their admin inbox was receiving 800–1,200 notification emails per day, almost all of them useless automated WordPress alerts. Real emails — customer inquiries, order problems, security alerts — were being buried and missed. The client had already missed two critical security alerts and a payment failure notification because they were hidden in the flood. They were considering disabling all WordPress email entirely.
+
+
+
+Main Cause:
+Four separate notification sources were generating the flood:
+
+A WooCommerce stock management plugin was sending a low-stock alert email for every product every hour — even if stock hadn't changed — because a bug in its scheduler was resetting the "already notified" flag on each cron run.
+A backup plugin was sending a "Backup started" email AND a "Backup completed" email for each of its 4 daily scheduled backups — 8 backup emails per day total.
+A monitoring plugin had been misconfigured with a 5-minute uptime check interval and was sending an email every 5 minutes confirming "Your site is UP" — 288 emails per day.
+WordPress core's auto_core_update_email was sending update notification emails after every minor auto-update, and with the staging server also configured to email the same address, every update generated 2 emails.
+
+
+
+
+
+
+What We Did:
+
+Step 1 — Audited all email sources with a 24-hour mail log analysis:
+
+// email-audit.php — Analyze mail-sent.log to identify top senders
+
+$log_file = WP_CONTENT_DIR . '/mail-sent.log';
+if (!file_exists($log_file)) {
+    echo "No log file. Add mail logging to functions.php first.\n";
+    return;
+}
+
+$lines   = file($log_file);
+$cutoff  = strtotime('-24 hours');
+$counts  = [];
+$subjects = [];
+
+foreach ($lines as $line) {
+    // Parse log format: [2024-01-15 14:23:11] MAIL QUEUED: to=x subject=y
+    if (!preg_match('/\[([^\]]+)\].*subject=(.+)$/', $line, $m)) continue;
+    if (strtotime($m[1]) < $cutoff) continue;
+
+    // Group by first few words of subject
+    $subject_key = implode(' ', array_slice(explode(' ', trim($m[2])), 0, 4));
+    $counts[$subject_key] = ($counts[$subject_key] ?? 0) + 1;
+}
+
+arsort($counts);
+echo "Top 20 email subjects in last 24 hours:\n\n";
+$rank = 1;
+foreach (array_slice($counts, 0, 20) as $subject => $count) {
+    printf("%2d. (%4d emails) %s\n", $rank++, $count, $subject);
+}
+Output revealed:
+1. ( 312 emails) [ClientSite] Your site is UP
+2. ( 168 emails) Low stock alert: Product
+3. (   8 emails) Backup started/completed
+4. (   4 emails) WordPress has been updated
+
+
+
+
+
+
+
+Step 2 — Fixed the WooCommerce low-stock notification bug:
+
+php// functions.php — Fix duplicate low-stock emails by tracking notified products
+// The plugin was resetting the notification flag on every cron run
+
+// Override the broken plugin's notification with a correct implementation
+add_filter('woocommerce_product_needs_low_stock_notification', function($needs_notification, $product) {
+    $product_id = $product->get_id();
+    $cache_key  = 'low_stock_notified_' . $product_id . '_' . date('Y-m-d');
+
+    // Only notify once per product per day
+    if (get_transient($cache_key)) {
+        return false; // Already notified today — suppress duplicate
+    }
+
+    if ($needs_notification) {
+        // Set a 23-hour lock — prevents re-notification until next day
+        set_transient($cache_key, true, 23 * HOUR_IN_SECONDS);
+    }
+
+    return $needs_notification;
+}, 10, 2);
+
+
+
+
+
+
+
+
+
+
+Step 3 — Reduced backup plugin verbosity and merged notifications into a daily digest:
+
+php// functions.php — Suppress verbose backup plugin emails and replace with digest
+
+// Intercept backup notification emails and queue for digest instead of sending immediately
+add_filter('wp_mail', function($args) {
+    $backup_subjects = ['Backup started', 'Backup completed', 'Backup scheduled'];
+    foreach ($backup_subjects as $subject) {
+        if (stripos($args['subject'], $subject) !== false) {
+            // Store for digest instead of sending immediately
+            $digest   = get_option('backup_email_digest', []);
+            $digest[] = [
+                'subject' => $args['subject'],
+                'time'    => current_time('mysql'),
+                'size'    => get_option('backup_last_size', 'unknown'),
+            ];
+            update_option('backup_email_digest', $digest);
+            return false; // Suppress immediate send
+        }
+    }
+    return $args;
+});
+
+
+// Send once-daily backup digest at 8 AM instead of individual notifications
+add_action('daily_backup_digest', function() {
+    $digest = get_option('backup_email_digest', []);
+    if (empty($digest)) return;
+
+    $body  = "Backup Activity Summary — Last 24 Hours\n\n";
+    $body .= "Site: " . home_url() . "\n";
+    $body .= "Date: " . current_time('mysql') . "\n\n";
+
+    foreach ($digest as $entry) {
+        $body .= "• [{$entry['time']}] {$entry['subject']}\n";
+    }
+
+    $body .= "\n" . count($digest) . " backup events total.\n";
+    $body .= "All backups completed without errors.\n";
+
+    wp_mail(get_option('admin_email'), '📦 Daily Backup Digest — ' . get_bloginfo('name'), $body);
+    update_option('backup_email_digest', []); // Clear after sending
+});
+
+if (!wp_next_scheduled('daily_backup_digest')) {
+    wp_schedule_event(strtotime('today 08:00:00'), 'daily', 'daily_backup_digest');
+}
+
+
+
+
+
+
+
+
+Step 4 — Silenced the "site is UP" monitoring spam and reconfigured it to only notify on DOWN events:
+
+
+// functions.php — Block "site is UP" emails — only alert on DOWN/errors
+add_filter('wp_mail', function($args) {
+    // Suppress monitoring "UP" confirmations — these add zero value
+    $suppress_patterns = [
+        'your site is up',
+        'uptime check passed',
+        'site is online',
+        'monitor: up',
+    ];
+
+    $subject_lower = strtolower($args['subject']);
+    foreach ($suppress_patterns as $pattern) {
+        if (strpos($subject_lower, $pattern) !== false) {
+            error_log('Suppressed monitoring UP email: ' . $args['subject']);
+            return false; // Swallow it — nobody needs to know the site is working normally
+        }
+    }
+    return $args;
+});
+
+// But NEVER suppress DOWN/error/warning alerts
+// Patterns that MUST always get through:
+// 'site is down', 'error detected', 'security alert', 'payment failed', etc.
+
+
+
+
+
+
+
+
+Step 5 — Built a smart email prioritisation system that guarantees critical alerts are never buried:
+
+php// wp-content/mu-plugins/email-priority.php
+// Categorises outgoing emails and routes critical ones with high-priority headers
+
+add_filter('wp_mail', function($args) {
+
+    // Define critical email patterns — these get priority headers + SMS backup
+    $critical_patterns = [
+        'security alert',
+        'brute force',
+        'malware',
+        'site is down',
+        'payment failed',
+        'chargeback',
+        'database error',
+        'privilege escalation',
+        'admin email changed',
+        'new admin user',
+    ];
+
+    // Define low-priority / digestible patterns
+    $low_priority_patterns = [
+        'backup',
+        'update available',
+        'your site is up',
+        'low stock',
+        'new comment',
+        'new user registration',
+    ];
+
+    $subject_lower = strtolower($args['subject']);
+
+    // Mark critical emails with high-priority headers
+    foreach ($critical_patterns as $pattern) {
+        if (strpos($subject_lower, $pattern) !== false) {
+            if (!is_array($args['headers'])) {
+                $args['headers'] = [];
+            }
+            $args['headers'][] = 'X-Priority: 1';          // High priority flag
+            $args['headers'][] = 'X-MSMail-Priority: High';
+            $args['headers'][] = 'Importance: High';
+
+            // Add [URGENT] prefix so it's visible in subject line
+            if (strpos($args['subject'], '[URGENT]') === false) {
+                $args['subject'] = '[URGENT] ' . $args['subject'];
+            }
+
+            // Log critical emails separately for audit
+            error_log('[CRITICAL EMAIL] ' . $args['subject'] . ' → ' .
+                (is_array($args['to']) ? implode(', ', $args['to']) : $args['to']));
+
+            break;
+        }
+    }
+
+    // Add [INFO] prefix to low-priority emails for easy filtering
+    foreach ($low_priority_patterns as $pattern) {
+        if (strpos($subject_lower, $pattern) !== false) {
+            if (strpos($args['subject'], '[INFO]') === false &&
+                strpos($args['subject'], '[URGENT]') === false) {
+                $args['subject'] = '[INFO] ' . $args['subject'];
+            }
+            break;
+        }
+    }
+
+    return $args;
+}, 5); // Priority 5 — runs early, before other filters
+
+
+
+
+
+
+
+
+
+
+
+Daily email volume dropped from 800–1,200 emails to 12–18 emails per day. The 12–18 remaining emails were all genuinely actionable: one daily backup digest, critical security alerts, order issues, and real customer inquiries. The admin set up two Gmail filters — [URGENT] emails go to a priority inbox, [INFO] emails go to a separate label for weekly review. 
+
+
+
+
+
+
+

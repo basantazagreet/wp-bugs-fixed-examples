@@ -1,0 +1,207 @@
+Bug Title / Short Description (one liner) :  "A security researcher emailed us — they can dump our entire database through the search box"
+Bug category: Security & Permissions
+
+
+Description:
+A membership site client received a responsible disclosure email from an independent security researcher. The researcher demonstrated they could extract usernames, hashed passwords, email addresses, and payment records from the database by appending SQL syntax to the search query parameter. They estimated the entire database could be exfiltrated in under 5 minutes using automated tooling.
+
+
+
+
+Main Cause:
+The custom search plugin was building its SQL query by directly concatenating the raw $_GET['s'] parameter into a $wpdb->query() call with no parameterization, no escaping, and no input validation whatsoever. Classic textbook SQL injection — the most preventable vulnerability in web development.
+
+// The vulnerable code in custom-search/search.php:
+add_action('template_redirect', function() {
+    if (!isset($_GET['s'])) return;
+    global $wpdb;
+
+    // Raw user input directly concatenated into SQL — textbook SQL injection
+    $search_term = $_GET['s'];
+    $results = $wpdb->get_results(
+        "SELECT ID, post_title FROM {$wpdb->posts}
+         WHERE post_status = 'publish'
+         AND (post_title LIKE '%" . $search_term . "%'
+              OR post_content LIKE '%" . $search_term . "%')"
+    );
+});
+
+
+// What the researcher was submitting as $_GET['s']:
+// %' UNION SELECT user_login, user_pass, user_email FROM wp_users-- -
+// This turned the query into:
+// ... LIKE '%%' UNION SELECT user_login, user_pass, user_email FROM wp_users-- -%'
+
+
+
+
+
+
+
+
+
+
+What we did:
+
+
+
+Step 1 — Confirmed and documented the vulnerability safely:
+
+
+# Boolean-based injection test — confirms injection without extracting data
+# If vulnerable, these return different result counts:
+
+
+# Always-true condition — returns normal results
+curl -s "https://client-site.com/?s=test%25' AND '1'='1" | grep -c "article"
+
+# Always-false condition — returns zero results if injectable
+curl -s "https://client-site.com/?s=test%25' AND '1'='2" | grep -c "article"
+
+
+# Different counts = confirmed injectable
+
+
+
+
+
+
+Step 2 — Patched the query immediately using $wpdb->prepare():
+// custom-search/search.php — FULLY PARAMETERIZED, injection-proof replacement
+
+
+add_action('template_redirect', function() {
+    if (!isset($_GET['s'])) return;
+    global $wpdb;
+
+    // Step 1: Sanitize and validate the input
+    $search_term = sanitize_text_field(trim($_GET['s']));
+
+    // Step 2: Reject unreasonably long or structured inputs
+    if (strlen($search_term) < 2 || strlen($search_term) > 200) {
+        return; // Silently ignore invalid-length inputs
+    }
+
+    // Step 3: Prepare LIKE wildcards OUTSIDE of prepare()
+    // $wpdb->esc_like() escapes %, _, and \ characters in the search term
+    // Then we wrap in % for the LIKE match — this is the correct pattern
+    $like = '%' . $wpdb->esc_like($search_term) . '%';
+
+    // Step 4: ALWAYS use $wpdb->prepare() for any query with variable input
+    // %s = string, %d = integer, %f = float — no exceptions
+    
+    $results = $wpdb->get_results($wpdb->prepare(
+        "SELECT ID, post_title, post_excerpt
+         FROM   {$wpdb->posts}
+         WHERE  post_status = 'publish'
+         AND    post_type   IN ('post', 'page')
+         AND    (post_title   LIKE %s OR post_content LIKE %s)
+         ORDER  BY post_date DESC
+         LIMIT  %d",
+        $like,  // First LIKE — title search
+        $like,  // Second LIKE — content search
+        20      // Hardcoded result limit — never from user input
+    ));
+
+    // Store for template — never echo raw DB values directly
+    set_query_var('custom_search_results', $results);
+    set_query_var('custom_search_term', esc_html($search_term));
+});
+
+
+
+
+
+
+Step 3 — Audited all other database calls in custom code for the same pattern:
+
+# Find all wpdb calls that do NOT use prepare() and reference variables
+
+grep -rn "\->query\|\->get_results\|\->get_row\|\->get_var\|\->get_col" \
+    /var/www/html/wp-content/plugins/custom-* \
+    /var/www/html/wp-content/themes/custom-theme/ \
+    | grep -v "prepare\|%s\|%d\|%f" \
+    | grep "\$_\|\$search\|\$id\|\$user\|\$order" \
+    > /tmp/sqli_audit.txt
+
+echo "Potential SQL injection vectors: $(wc -l < /tmp/sqli_audit.txt)"
+cat /tmp/sqli_audit.txt
+
+
+
+
+
+Step 4 — Added a WAF-style request filter to block injection patterns at the application layer:
+
+// mu-plugins/sqli-guard.php — Block common SQL injection patterns early
+add_action('init', function() {
+    $query_string = urldecode($_SERVER['QUERY_STRING'] ?? '');
+    $request_uri  = urldecode($_SERVER['REQUEST_URI'] ?? '');
+    $input        = $query_string . $request_uri;
+
+    $patterns = [
+        '/\bUNION\b.{0,20}\bSELECT\b/i',   // UNION SELECT
+        '/\bSELECT\b.{0,20}\bFROM\b/i',     // SELECT FROM
+        '/\bDROP\b.{0,10}\bTABLE\b/i',       // DROP TABLE
+        '/(--|#)\s*$/m',                       // SQL comment sequences
+        '/\bOR\b\s+[\'"]?\d+[\'"]?\s*=\s*[\'"]?\d+/i',  // OR 1=1
+        '/SLEEP\s*\(\s*\d+\s*\)/i',           // Time-based injection
+        '/BENCHMARK\s*\(\s*\d+/i',            // Benchmark injection
+        '/INFORMATION_SCHEMA/i',               // Schema enumeration
+    ];
+
+    foreach ($patterns as $pattern) {
+        if (preg_match($pattern, $input)) {
+            error_log(sprintf(
+                '[SQLi ATTEMPT] ip=%s uri=%s',
+                $_SERVER['REMOTE_ADDR'],
+                $_SERVER['REQUEST_URI']
+            ));
+            wp_die('Invalid request.', 'Security Error', ['response' => 400]);
+        }
+    }
+}, 1);
+
+
+
+
+
+
+
+Step 5 — Rotated all database credentials and salts as a precautionary measure:
+
+# Generate a new strong database password
+NEW_DB_PASS=$(openssl rand -base64 32)
+
+# Update MySQL
+mysql -u root -p -e \
+    "ALTER USER 'wp_db_user'@'localhost' IDENTIFIED BY '${NEW_DB_PASS}';"
+
+# Update wp-config.php
+wp config set DB_PASSWORD "${NEW_DB_PASS}"
+
+# Rotate WordPress salts
+wp config shuffle-salts
+
+# Invalidate all active user sessions
+wp eval 'WP_Session_Tokens::destroy_all_for_all_users();'
+
+
+
+
+
+Zero confirmed data exfiltration was found in server access logs. The researcher received a formal thank-you and bug bounty reward.
+
+
+
+
+
+
+
+ 
+
+
+Main Cause:
+
+
+What we Did:

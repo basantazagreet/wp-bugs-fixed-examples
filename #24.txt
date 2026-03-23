@@ -1,0 +1,46 @@
+Bug Title / Short Description (one liner) : "Two users share the same email and now neither can log in"
+Bug category: Authentication & User Management
+Description: During a WooCommerce data migration, a script accidentally inserted duplicate email addresses for two separate user accounts. WordPress's authentication depends on unique emails, so both users were effectively locked out.
+
+
+Main Cause:
+The migration script didn't run email_exists() checks before inserting users, causing a database-level duplicate in wp_users.
+
+
+What we Did:
+
+First identified the duplicates via a direct database query:
+
+SELECT user_email, COUNT(*) as count
+FROM wp_users
+GROUP BY user_email
+HAVING count > 1;
+
+
+
+Then ran a targeted fix using WP-CLI and a small PHP script to reassign a corrected email to one of the duplicates and trigger a re-verification:
+
+
+// Run via WP-CLI: wp eval-file fix-duplicate-emails.php
+
+$duplicate_email = 'affected@example.com';
+$users = get_users(['search' => $duplicate_email, 'search_columns' => ['user_email']]);
+
+if (count($users) >= 2) {
+    // Keep first user as-is, fix the second
+    $duplicate_user = $users[1];
+    $new_temp_email = 'needs-update+' . $duplicate_user->ID . '@clientdomain.com';
+    
+    wp_update_user([
+        'ID'         => $duplicate_user->ID,
+        'user_email' => $new_temp_email,
+    ]);
+
+    // Force password reset so user sets a new verified email
+    wp_send_new_user_notifications($duplicate_user->ID, 'user');
+    echo "Fixed user ID {$duplicate_user->ID} — temp email assigned.\n";
+}
+
+
+Both users could log in again within minutes, and the affected user was guided to update their email from their profile. 
+

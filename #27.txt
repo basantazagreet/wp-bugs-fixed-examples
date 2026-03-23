@@ -1,0 +1,44 @@
+Bug Title / Short Description (one liner) : "My site went completely white after I activated a new theme"
+Bug category: Themes & Template Rendering
+
+
+Description: 
+A client activated a premium theme they purchased from ThemeForest and immediately got a White Screen of Death (WSOD) — no error message, just a blank white page on both the frontend and wp-admin.
+
+
+Main Cause:
+The theme required PHP 8.0+ but the server was running PHP 7.2. A deprecated function call in the theme's functions.php was causing a fatal error that WordPress was silently swallowing.
+
+
+What we Did:
+
+First, enabled debugging to expose the actual error:
+
+// wp-config.php — temporarily enable debug mode
+define('WP_DEBUG', true);
+define('WP_DEBUG_LOG', true);
+define('WP_DEBUG_DISPLAY', false); // Log to file, not screen
+
+
+The log revealed:
+
+Fatal error: Uncaught TypeError: implode(): Argument #1 must be of type array|string
+in /wp-content/themes/premiumtheme/functions.php on line 412
+The theme was using implode() with reversed argument order — which was deprecated in PHP 7.4 and fatal in PHP 8+. Since the server couldn't be upgraded immediately, we patched the theme's function in a child theme:
+
+
+// child theme functions.php — override the broken function
+if (!function_exists('premiumtheme_get_classes')) {
+    function premiumtheme_get_classes($classes, $separator = ' ') {
+        // Fixed argument order for implode()
+        return implode($separator, (array) $classes);
+    }
+}
+
+Then coordinated with the host to upgrade to PHP 8.1, and the child theme override was removed cleanly. 
+
+
+
+
+
+

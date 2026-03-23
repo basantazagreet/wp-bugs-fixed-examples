@@ -1,0 +1,202 @@
+Bug Title / Short Description (one liner) :  "Our custom REST endpoint returns 404 — but we registered it correctly"
+Bug category: REST API & XML-RPC
+
+
+Description: 
+A development agency brought us in after spending three days unable to get a custom REST API route to work. Their endpoint /wp-json/bookings/v1/availability consistently returned 404 Not Found despite the route registration code looking syntactically correct. All other REST endpoints on the site worked fine.
+
+
+
+
+Main Cause :
+The route registration code was placed inside a plugin that called register_rest_route() directly on plugins_loaded — before the REST API server had been fully initialised. WordPress builds its REST route registry during rest_api_init, which fires after plugins_loaded. Because the route was registered too early, it was never added to the active route registry and simply did not exist at request time.
+
+A secondary issue: the WordPress permalink structure was set to Plain on the staging environment. The REST API requires pretty permalinks — without them, /wp-json/ routes are not resolvable.
+
+
+// The broken registration in the plugin:
+add_action('plugins_loaded', function() {
+    // Called too early — REST server not yet initialised
+    register_rest_route('bookings/v1', '/availability', [
+        'methods'             => 'GET',
+        'callback'            => 'get_booking_availability',
+        'permission_callback' => '__return_true',
+    ]);
+});
+
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Diagnosed the hook timing issue by checking registered routes at runtime:
+
+// Temporary debug — check if route is present after REST init
+add_action('rest_api_init', function() {
+    $routes = rest_get_server()->get_routes();
+    $booking_routes = array_filter(
+        array_keys($routes),
+        fn($r) => strpos($r, 'bookings') !== false
+    );
+    error_log('Booking routes found: ' . print_r($booking_routes, true));
+    // Log showed: Array() — route was never registered
+}, 999);
+
+
+
+
+
+
+Step 2 — Fixed the hook from plugins_loaded to rest_api_init:
+
+// bookings-plugin/plugin.php — Fixed: correct hook timing
+
+add_action('rest_api_init', function() {
+
+    // Availability check endpoint
+    register_rest_route('bookings/v1', '/availability', [
+        'methods'             => WP_REST_Server::READABLE,
+        'callback'            => 'get_booking_availability',
+        'permission_callback' => '__return_true',
+        'args'                => [
+            'date' => [
+                'required'          => true,
+                'type'              => 'string',
+                'format'            => 'date',
+                'sanitize_callback' => 'sanitize_text_field',
+                'validate_callback' => function($param) {
+                    return (bool) strtotime($param);
+                },
+                'description' => 'Date to check (YYYY-MM-DD)',
+            ],
+            'service_id' => [
+                'required'          => true,
+                'type'              => 'integer',
+                'sanitize_callback' => 'absint',
+            ],
+        ],
+    ]);
+
+    // Create booking endpoint
+    register_rest_route('bookings/v1', '/book', [
+        'methods'             => WP_REST_Server::CREATABLE,
+        'callback'            => 'create_booking',
+        'permission_callback' => function() {
+            return is_user_logged_in();
+        },
+    ]);
+});
+
+
+
+
+
+
+Step 3 — Fixed the permalink structure on staging:
+
+
+
+# WP-CLI — set permalinks to postname and flush rewrite rules
+
+wp rewrite structure '/%postname%/' --hard
+wp rewrite flush --hard
+
+
+# Verify REST API base is resolving
+wp eval 'echo rest_url();'
+# Output: https://staging.client-site.com/wp-json/
+
+
+
+
+
+
+
+Step 4 — Built out the complete availability callback with proper validation and response:
+
+// bookings-plugin/plugin.php — Full availability endpoint
+function get_booking_availability($request) {
+    $date       = sanitize_text_field($request->get_param('date'));
+    $service_id = absint($request->get_param('service_id'));
+
+    // Verify the service post exists
+    $service = get_post($service_id);
+    if (!$service || $service->post_type !== 'booking_service') {
+        return new WP_Error('invalid_service', 'Service not found.', ['status' => 404]);
+    }
+
+    global $wpdb;
+    $slots = $wpdb->get_results($wpdb->prepare("
+        SELECT slot_time, available_capacity, booked_count
+        FROM {$wpdb->prefix}booking_slots
+        WHERE service_id = %d
+        AND   slot_date  = %s
+        AND   slot_time  >= NOW()
+        ORDER BY slot_time ASC
+    ", $service_id, $date));
+
+    if (empty($slots)) {
+        return rest_ensure_response([
+            'date'      => $date,
+            'service'   => $service->post_title,
+            'available' => false,
+            'slots'     => [],
+        ]);
+    }
+
+    $formatted_slots = array_map(function($slot) {
+        return [
+            'time'      => $slot->slot_time,
+            'available' => ($slot->available_capacity - $slot->booked_count) > 0,
+            'remaining' => max(0, $slot->available_capacity - $slot->booked_count),
+        ];
+    }, $slots);
+
+    return rest_ensure_response([
+        'date'    => $date,
+        'service' => $service->post_title,
+        'slots'   => $formatted_slots,
+    ]);
+}
+
+
+
+
+
+
+Step 5 — Added a dev-mode warning to catch early-registration bugs in future plugins:
+
+
+// functions.php — Dev-only: warn if routes were registered before rest_api_init
+
+if (defined('WP_DEBUG') && WP_DEBUG) {
+    $pre_init_count = null;
+
+    add_action('plugins_loaded', function() use (&$pre_init_count) {
+        $pre_init_count = count(rest_get_server()->get_routes());
+    }, 999);
+
+    add_action('rest_api_init', function() use (&$pre_init_count) {
+        $post_init_count = count(rest_get_server()->get_routes());
+        if ($post_init_count === $pre_init_count) {
+            error_log('WARNING: No new REST routes were registered during rest_api_init. Check hook timing.');
+        }
+    }, 999);
+}
+
+
+
+
+
+
+The endpoint returned correct availability data immediately after the hook fix and permalink flush. The agency team saved at least two more days of debugging. 
+
+
+
+
+
+
+

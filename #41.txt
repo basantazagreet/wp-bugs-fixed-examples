@@ -1,0 +1,73 @@
+Bug Title / Short Description (one liner) : "Yoast SEO is overwriting our custom Open Graph meta tags"
+Bug category: Plugin Compatibility & Integration
+
+
+Description: 
+A media company was using a custom plugin (built by a previous developer) to output Open Graph meta tags for their articles — including custom og:image selections per post. After upgrading Yoast SEO to version 20+, Yoast started outputting its own Open Graph tags and completely overriding the custom ones, causing incorrect images and descriptions to appear when articles were shared on social media.
+
+
+Main Cause:
+The custom plugin was outputting og:image using a low-priority wp_head hook. Yoast SEO's newer versions output Open Graph tags at a higher hook priority and do not check for existing tags — it simply outputs its own regardless, resulting in duplicate or conflicting tags, with Yoast's version always winning because it was parsed last.
+
+
+What we Did:
+Audited both plugins' wp_head hook priorities:
+
+// What the custom plugin was doing:
+add_action('wp_head', 'custom_output_og_tags', 10); // Priority 10
+
+
+// What Yoast does internally:
+add_action('wp_head', array($this, 'head'), 1);      // Priority 1 — outputs FIRST
+
+
+// But social previews win because crawlers use last-defined tag.
+Rather than fighting hook priorities, the cleanest fix was to disable Yoast's Open Graph output and let the custom plugin take full ownership:
+
+// functions.php — Disable Yoast's Open Graph output selectively
+add_filter('wpseo_output_social_og', '__return_false'); // Disable all Yoast OG output
+
+// Alternatively, disable per-tag for more granular control:
+add_filter('wpseo_opengraph_image',       '__return_false');
+add_filter('wpseo_opengraph_desc',        '__return_false');
+add_filter('wpseo_opengraph_title',       '__return_false');
+
+
+
+Then updated the custom plugin to pull Yoast's SEO title and description as a fallback when no custom value was set:
+
+// custom-og-plugin.php — Use Yoast data as intelligent fallback
+function custom_output_og_tags() {
+    if (!is_singular()) return;
+    global $post;
+
+    // Prefer custom meta, fall back to Yoast's analysis
+    $og_title = get_post_meta($post->ID, '_custom_og_title', true);
+    if (empty($og_title) && function_exists('YoastSEO')) {
+        $og_title = YoastSEO()->meta->for_post($post->ID)->title;
+    }
+    $og_title = $og_title ?: get_the_title();
+
+    $og_image = get_post_meta($post->ID, '_custom_og_image', true);
+    if (empty($og_image)) {
+        $og_image = get_the_post_thumbnail_url($post->ID, 'large');
+    }
+
+    echo '<meta property="og:title" content="' . esc_attr($og_title) . '" />' . "\n";
+    if ($og_image) {
+        echo '<meta property="og:image" content="' . esc_url($og_image) . '" />' . "\n";
+    }
+}
+add_action('wp_head', 'custom_output_og_tags', 5);
+
+
+
+
+Social sharing previews were accurate and consistent across all platforms after the fix. 
+
+
+
+
+
+
+

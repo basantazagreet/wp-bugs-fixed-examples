@@ -1,0 +1,103 @@
+Bug Title / Short Description (one liner) :  "I save my post, walk away, come back and my changes are completely gone"
+Bug category: Post, Page & Content Editor
+
+
+Description:
+A solo blogger client was losing post edits silently and consistently. She would write, click "Update," see the green "Post updated" confirmation, navigate away — and return to find the post had reverted to its previous version. This had happened more than a dozen times across different posts, causing her to re-write content repeatedly.
+
+
+
+Main Cause:
+Two compounding issues were found:
+
+The site was hosted on a server with a misconfigured POST request size limit (post_max_size = 2MB in php.ini). Her posts with multiple images embedded as base64 in block markup were exceeding this limit. When the save request was truncated by the server, WordPress received a partial payload, silently fell back to the autosaved revision, and returned a 200 OK — with no visible error to the user.
+The Autosave interval was set aggressively by another plugin to every 10 seconds, causing a race condition where an autosave was occasionally being written at the same moment as a manual save, with the autosave winning due to a timestamp tie.
+
+
+
+
+What We Did:
+
+
+
+Step 1 — Confirmed the POST size issue by adding a temporary request size logger:
+
+// functions.php — Log content size on every post save
+add_action('save_post', function($post_id, $post) {
+    $content_size = strlen($post->post_content);
+    error_log("Post save: ID=$post_id, content_size={$content_size} bytes");
+}, 10, 2);
+
+// Log showed content sizes of 2.1–3.4 MB — exceeding the 2MB POST limit
+
+
+
+
+Step 2 — Increased the PHP limits on the server:
+
+
+ini; php.ini — Updated limits
+post_max_size       = 64M
+upload_max_filesize = 64M
+memory_limit        = 256M
+max_execution_time  = 120
+
+For hosts where php.ini wasn't directly editable, added to .htaccess:
+
+# .htaccess — PHP limit overrides
+php_value post_max_size       64M
+php_value upload_max_filesize 64M
+php_value memory_limit        256M
+
+
+
+Step 3 — Fixed the autosave race condition by normalizing the autosave interval:
+
+// functions.php — Set a safe autosave interval (60 seconds)
+add_action('wp_enqueue_scripts', function() {
+    if (is_admin()) {
+        wp_deregister_script('autosave');
+    }
+});
+
+
+// Reset autosave interval for the editor
+add_filter('wp_default_editor_autosave_interval', function() {
+    return 60; // seconds — safe interval to avoid race conditions
+});
+
+
+
+
+
+
+Step 4 — Added a save confirmation that shows actual server response, not just the UI flash:
+
+// Enqueue in admin only — shows real save status from REST API response
+wp.data.subscribe(() => {
+    const isSaving    = wp.data.select('core/editor').isSavingPost();
+    const isAutosaving = wp.data.select('core/editor').isAutosavingPost();
+
+    if (!isSaving && !isAutosaving) {
+        const saveError = wp.data.select('core/editor').getPostSavingError();
+        if (saveError) {
+            wp.data.dispatch('core/notices').createErrorNotice(
+                'Save failed: ' + saveError.message +
+                ' — Please copy your content and try again.',
+                { isDismissible: true, id: 'save-failure-notice' }
+            );
+        }
+    }
+});
+
+
+
+
+After fixing the PHP limits and autosave interval, saves were reliable and the client never lost content again. 
+
+
+
+
+
+
+

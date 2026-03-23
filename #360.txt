@@ -1,0 +1,189 @@
+Bug Title / Short Description (one liner) : "Password reset emails take 4 to 6 hours to arrive — users give up and call us"
+Bug category: Email & Notifications
+
+Description: 
+A SaaS platform client reported that password reset emails were consistently arriving 4–6 hours late — sometimes longer. The emails eventually delivered, so there was no hard failure, but the delay made the feature practically useless. Users requesting a password reset would wait, give up, and call support. The reset link also expired in 24 hours, and several users were reporting their link had expired by the time the email arrived.
+
+
+
+Main Cause:
+The delay was caused by two compounding issues:
+
+WordPress's password reset was triggered via WP-Cron — a "virtual" cron system that only fires when someone visits the site. The platform had very low traffic between midnight and 6 AM, which meant WP-Cron jobs queued during those hours wouldn't fire until the next visitor arrived — sometimes hours later. Password reset requests submitted at night were queued but not processed until morning traffic arrived.
+A custom plugin had wrapped wp_mail() in a cron task instead of sending immediately — ostensibly to "prevent slowdowns on form submit." This meant every email, including time-sensitive ones like password resets, was queued in WP-Cron rather than sent synchronously.
+
+
+// The problematic plugin code — queuing ALL emails including time-sensitive ones:
+add_filter('wp_mail', function($args) {
+    // Schedule every email as a cron job instead of sending immediately
+    wp_schedule_single_event(time() + 60, 'send_queued_email', [$args]);
+    return false; // Prevents wp_mail from actually sending
+});
+// This delays ALL emails by at least 60 seconds PLUS WP-Cron latency
+
+
+
+
+
+
+ What We Did:
+
+
+
+Step 1 — Identified the queuing plugin and measured the actual delay:
+
+bash# Check what's in the WP-Cron queue
+wp cron event list --format=table
+
+# Output showed hundreds of 'send_queued_email' events
+# with scheduled times hours in the past — never fired due to no traffic
+
+
+
+
+
+
+
+Step 2 — Removed the blanket email queuing and replaced it with selective async for bulk/non-urgent emails only:
+
+php// functions.php — Remove blanket email queue — time-sensitive emails must send immediately
+
+// Remove the problematic filter
+remove_filter('wp_mail', 'queue_all_emails_as_cron');
+
+// Add a smart filter that only queues non-urgent bulk emails
+add_filter('wp_mail', function($args) {
+
+    // Define which subjects are time-sensitive — these MUST send immediately
+    $urgent_subject_patterns = [
+        'password reset',
+        'reset your password',
+        'your verification',
+        'confirm your email',
+        'two-factor',
+        'login attempt',
+        'account locked',
+        'security alert',
+        'order confirmation',
+        'payment',
+        'invoice',
+    ];
+
+    $subject_lower = strtolower($args['subject']);
+    foreach ($urgent_subject_patterns as $pattern) {
+        if (strpos($subject_lower, $pattern) !== false) {
+            return $args; // Send immediately — do NOT queue
+        }
+    }
+
+    // Non-urgent bulk emails (newsletters, digests) can be queued
+    $bulk_patterns = ['newsletter', 'weekly digest', 'monthly report', 'bulk'];
+    foreach ($bulk_patterns as $pattern) {
+        if (strpos($subject_lower, $pattern) !== false) {
+            // Queue for async send — won't delay the user's request
+            wp_schedule_single_event(time() + 30, 'send_queued_email', [$args]);
+            return false; // Prevent immediate send for bulk only
+        }
+    }
+
+    return $args; // Default: send immediately
+});
+
+
+
+
+
+
+
+Step 3 — Replaced WP-Cron with a real server cron to ensure timely execution:
+
+# Disable WP-Cron's HTTP-triggered mode
+# wp-config.php:
+# define('DISABLE_WP_CRON', true);
+
+# Add a real server cron job that fires every minute
+crontab -e
+
+# Add this line to run WordPress cron every minute via WP-CLI
+* * * * * /usr/local/bin/wp cron event run --due-now --path=/var/www/html --quiet
+
+# Verify the cron job is registered
+crontab -l | grep wp
+
+php// wp-config.php — Disable unreliable HTTP-triggered WP-Cron
+// (now handled by server cron above)
+define('DISABLE_WP_CRON', true);
+
+// Optional: set an alternate cron interval for any remaining WP-Cron usage
+define('WP_CRON_LOCK_TIMEOUT', 60);
+
+
+
+
+
+
+
+
+Step 4 — Extended the password reset link lifetime to give users a more forgiving window:
+
+// functions.php — Extend password reset key expiry to 48 hours (default is 24)
+add_filter('password_reset_expiration', function() {
+    return 48 * HOUR_IN_SECONDS;
+});
+
+// Also add a timestamp to the password reset email so users know when it expires
+add_filter('retrieve_password_message', function($message, $key, $user_login, $user_data) {
+    $expiry_hours = apply_filters('password_reset_expiration', DAY_IN_SECONDS) / HOUR_IN_SECONDS;
+    $expiry_time  = date('g:i A T', time() + ($expiry_hours * HOUR_IN_SECONDS));
+
+    $message .= "\n\n---\n";
+    $message .= sprintf(
+        "This link expires in %d hours (at %s). If you did not request a password reset, " .
+        "please ignore this email — your password will remain unchanged.",
+        $expiry_hours,
+        $expiry_time
+    );
+
+    return $message;
+}, 10, 4);
+
+
+
+
+
+
+
+Step 5 — Added email send time monitoring to alert on any future queuing delays:
+
+
+// functions.php — Monitor time between wp_mail() call and actual SMTP delivery
+add_filter('wp_mail', function($args) {
+    $args['_queued_at'] = microtime(true); // Attach timestamp
+    return $args;
+});
+
+add_action('phpmailer_init', function($phpmailer) {
+    // After PHPMailer is configured — check if email was queued long ago
+    if (isset($phpmailer->_queued_at)) {
+        $delay_seconds = microtime(true) - $phpmailer->_queued_at;
+        if ($delay_seconds > 30) {
+            error_log(sprintf(
+                'Email delivery delay detected: %.1f seconds between wp_mail() and SMTP send. ' .
+                'Subject: %s',
+                $delay_seconds,
+                $phpmailer->Subject
+            ));
+        }
+    }
+});
+
+
+
+
+
+Password reset emails began delivering in under 8 seconds after the fix. The server cron ensured WP-Cron fired every 60 seconds regardless of traffic levels. User support tickets about password reset delays dropped to zero within 48 hours. 
+
+
+
+
+

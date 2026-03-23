@@ -1,0 +1,284 @@
+Bug Title / Short Description (one liner) :  "Users who register on any sub-site are creating duplicate accounts across our network"
+Bug category: Multisite Network
+
+
+Description: 
+A SaaS platform running a Multisite network with 8 product sub-sites noticed that their user database was growing at 3x the expected rate. Investigation revealed that when a user registered on one sub-site, WordPress was creating a separate user record in wp_users for that same email address when the user later visited and registered on a different sub-site. Users had up to 8 separate accounts — one per sub-site — all with different passwords, different profiles, and completely siloed histories. Customer support was overwhelmed with "I can't log in to Site B with my Site A credentials" tickets.
+
+
+
+
+Main Cause:
+WordPress Multisite shares the wp_users table across all sites but manages per-site membership separately via wp_usermeta (using meta keys like wp_3_capabilities). The problem was a combination of:
+
+The registration form on each sub-site was not checking whether the email already existed in wp_users before creating a new account — because a custom registration plugin had disabled WordPress's built-in email_exists() check to allow "flexible" registration.
+When a returning user visited a new sub-site and tried to register with the same email, instead of being told "this email is already registered — please log in," they were being issued a brand new user account with the same email but a different user ID and a fresh password.
+The wp_usermeta rows for the new duplicate accounts were being added to the sub-site's user list, while the original account had no access to that sub-site — resulting in completely isolated identities for the same real person.
+
+
+
+
+
+
+
+What We Did:
+
+
+
+Step 1 — Audited the extent of duplicate accounts:
+
+sql-- Find all duplicate emails in wp_users
+
+SELECT
+    user_email,
+    COUNT(*)       AS account_count,
+    GROUP_CONCAT(ID ORDER BY ID ASC)               AS user_ids,
+    GROUP_CONCAT(user_registered ORDER BY ID ASC)  AS registration_dates
+FROM wp_users
+GROUP BY user_email
+HAVING account_count > 1
+ORDER BY account_count DESC
+LIMIT 50;
+
+
+
+-- Count total duplicates
+SELECT COUNT(*) AS duplicate_emails
+FROM (
+    SELECT user_email
+    FROM wp_users
+    GROUP BY user_email
+    HAVING COUNT(*) > 1
+) AS dupes;
+
+-- Result: 4,847 duplicate email addresses — 12,291 extra accounts
+
+
+
+
+
+
+Step 2 — Re-enabled the email uniqueness check and fixed the registration plugin:
+
+// custom-registration-plugin/plugin.php — Fix email uniqueness enforcement
+
+// Remove the bad override that was disabling the email check
+remove_filter('registration_errors', 'skip_duplicate_email_check');
+
+// Add a proper network-aware email uniqueness check
+add_filter('registration_errors', function($errors, $sanitized_user_login, $user_email) {
+
+    if (empty($user_email)) return $errors;
+
+    // Check if email exists anywhere in the network (not just current site)
+    $existing_user = get_user_by('email', $user_email);
+
+    if ($existing_user) {
+        // Don't say "already registered" — instead offer to add to current site
+        $is_member_here = is_user_member_of_blog($existing_user->ID, get_current_blog_id());
+
+        if ($is_member_here) {
+            // Full duplicate — user already has access to this site
+            $errors->add('email_exists',
+                sprintf(
+                    '<strong>Error:</strong> This email is already registered. ' .
+                    '<a href="%s">Log in</a> or <a href="%s">reset your password</a>.',
+                    esc_url(wp_login_url()),
+                    esc_url(wp_lostpassword_url())
+                )
+            );
+        } else {
+            // User exists on network but not this sub-site — add them instead of duplicating
+            // We'll handle this in the registration completion hook below
+            // For now, flag for special handling with a transient
+            set_transient(
+                'network_user_join_' . md5($user_email),
+                $existing_user->ID,
+                HOUR_IN_SECONDS
+            );
+        }
+    }
+
+    return $errors;
+}, 10, 3);
+
+
+
+
+
+
+
+
+
+Step 3 — Added a network-aware registration handler that adds existing users to new sub-sites instead of creating duplicates:
+
+
+// custom-registration-plugin/plugin.php — Smart cross-site user handling
+
+add_action('user_register', function($new_user_id) {
+    global $wpdb;
+
+    $new_user  = get_user_by('ID', $new_user_id);
+    $email     = $new_user->user_email;
+    $cache_key = 'network_user_join_' . md5($email);
+
+    // Check if we flagged this as an existing network user
+    $existing_user_id = get_transient($cache_key);
+
+    if ($existing_user_id && $existing_user_id !== $new_user_id) {
+        delete_transient($cache_key);
+
+        // Add the EXISTING user to this sub-site with appropriate role
+        add_user_to_blog(get_current_blog_id(), $existing_user_id, 'subscriber');
+
+        // Delete the freshly created duplicate account
+        require_once ABSPATH . 'wp-admin/includes/user.php';
+        wpmu_delete_user($new_user_id); // Network-aware deletion
+
+        // Log the merge for audit purposes
+        error_log(sprintf(
+            'Prevented duplicate: existing user %d added to blog %d instead of creating new account for %s',
+            $existing_user_id,
+            get_current_blog_id(),
+            $email
+        ));
+
+        // Set a cookie so the login form pre-fills for the existing user
+        setcookie('wp_prefill_email', $email, time() + 3600, COOKIEPATH, COOKIE_DOMAIN);
+    }
+});
+
+
+
+
+
+
+
+
+
+Step 4 — Merged existing duplicate accounts with a safe consolidation script:
+
+
+// merge-duplicate-users.php — Run via: wp eval-file merge-duplicate-users.php
+// ALWAYS run on a database backup first
+
+global $wpdb;
+require_once ABSPATH . 'wp-admin/includes/user.php';
+
+// Get all duplicate emails
+$duplicates = $wpdb->get_results("
+    SELECT user_email, GROUP_CONCAT(ID ORDER BY ID ASC) AS ids, COUNT(*) AS cnt
+    FROM {$wpdb->users}
+    GROUP BY user_email
+    HAVING cnt > 1
+");
+
+$merged = 0;
+$errors = 0;
+
+foreach ($duplicates as $dup) {
+    $ids         = explode(',', $dup->ids);
+    $primary_id  = (int) $ids[0]; // Keep the oldest account as primary
+    $merge_ids   = array_slice($ids, 1); // Delete the rest after migration
+
+    foreach ($merge_ids as $merge_id) {
+        $merge_id = (int) $merge_id;
+
+        // Reassign all posts from duplicate to primary
+        $wpdb->update($wpdb->posts,
+            ['post_author' => $primary_id],
+            ['post_author' => $merge_id]
+        );
+
+        // Reassign all comments from duplicate to primary
+        $wpdb->update($wpdb->comments,
+            ['user_id' => $primary_id],
+            ['user_id' => $merge_id]
+        );
+
+        // Copy sub-site memberships from duplicate to primary
+        $sites = get_blogs_of_user($merge_id);
+        foreach ($sites as $site) {
+            if (!is_user_member_of_blog($primary_id, $site->userblog_id)) {
+                add_user_to_blog($site->userblog_id, $primary_id, 'subscriber');
+            }
+        }
+
+        // Copy any unique user meta from duplicate to primary
+        $dup_meta = get_user_meta($merge_id);
+        foreach ($dup_meta as $key => $values) {
+            // Skip WordPress internal meta that shouldn't be copied
+            if (preg_match('/^wp_\d+_/', $key)) continue;
+            if (get_user_meta($primary_id, $key, true)) continue; // Don't overwrite
+
+            foreach ($values as $value) {
+                add_user_meta($primary_id, $key, $value);
+            }
+        }
+
+        // Safely delete the duplicate account
+        wpmu_delete_user($merge_id);
+        $merged++;
+
+        echo "Merged user $merge_id into $primary_id ($dup->user_email)\n";
+    }
+}
+
+echo "\nMerge complete. Merged: $merged accounts.\n";
+
+
+
+
+
+
+
+
+
+Step 5 — Implemented single network-wide SSO so users log in once and have access to all sub-sites:
+
+// wp-content/mu-plugins/network-sso.php — Single Sign-On across all sub-sites
+
+/**
+ * When a user logs in to any sub-site, automatically grant them
+ * subscriber access to all other sub-sites in the network.
+ * This prevents the "I can't access Site B" support tickets entirely.
+ */
+add_action('wp_login', function($user_login, $user) {
+    $network_sites = get_sites(['number' => 200, 'fields' => 'ids']);
+
+    foreach ($network_sites as $site_id) {
+        // Add user to each site if not already a member
+        if (!is_user_member_of_blog($user->ID, $site_id)) {
+            add_user_to_blog($site_id, $user->ID, 'subscriber');
+        }
+    }
+}, 10, 2);
+
+/**
+ * Propagate password changes across the network.
+ * Since wp_users is shared, this happens automatically — but
+ * clear any site-specific auth cookies that may be cached.
+ */
+add_action('profile_update', function($user_id, $old_data) {
+    $new_data = get_user_by('ID', $user_id);
+    if ($new_data->user_pass !== $old_data->user_pass) {
+        // Password changed — invalidate all sessions across the network
+        $sessions = WP_Session_Tokens::get_instance($user_id);
+        $sessions->destroy_all();
+
+        error_log("Password changed for user $user_id — all network sessions invalidated.");
+    }
+}, 10, 2);
+
+
+
+
+
+
+
+Duplicate account creation was permanently stopped. The 12,291 duplicate accounts were safely merged into 4,847 primary accounts over a 4-hour maintenance window. Support tickets about cross-site login issues dropped to zero within the first week. 
+
+
+
+
+

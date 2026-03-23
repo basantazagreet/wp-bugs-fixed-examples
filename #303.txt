@@ -1,0 +1,249 @@
+Bug Title / Short Description (one liner) : "After configuring WPML, half our URLs redirect to the wrong language version"
+Bug category: Permalinks & URL Routing
+
+Description: 
+An international e-commerce client had set up WPML (WordPress Multilingual Plugin) to serve their site in English, French, and German. The URL structure was configured as:
+
+English: clientsite.com/ (default, no prefix)
+French: clientsite.com/fr/
+German: clientsite.com/de/
+
+After going live, several problems emerged: some French product URLs were redirecting to their English equivalents, some German category pages were serving the French version, and the WooCommerce checkout (/checkout/) was redirecting German users to the French checkout page. Approximately 30% of multilingual URLs were routing to the wrong language.
+
+
+
+
+Main Cause:
+Three compounding issues:
+
+WPML's language negotiation was using cookie-based detection as a fallback, and several users had residual language cookies from beta testing that were overriding URL-based routing.
+WooCommerce's endpoint pages (checkout, cart, my-account) had been translated and assigned slugs in WPML, but the rewrite rules for these endpoints were generated before WPML's language filters fired — so WooCommerce registered checkout/ as an English endpoint, and WPML's fr/checkout/ and de/checkout/ rules conflicted with existing rewrite entries.
+The Nginx configuration was missing the try_files directive for language-prefixed URLs, causing clientsite.com/fr/some-page/ to 404 at the server level before WordPress could route it — Nginx was serving the cached 404 response for some URLs.
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Diagnosed the routing failures systematically:
+
+bash# Test each language URL variant for a known product
+for lang_path in "" "fr/" "de/"; do
+    url="https://clientsite.com/${lang_path}products/winter-jacket/"
+    echo -n "/${lang_path}products/winter-jacket/ → "
+    curl -sI "$url" | grep -E "^HTTP|^location:" | tr '\n' ' '
+    echo
+done
+
+# Output:
+# /products/winter-jacket/         → HTTP/2 200
+# /fr/products/veste-hiver/        → HTTP/2 301 → location: /products/winter-jacket/  ❌
+# /de/products/winterjacke/        → HTTP/2 200  ✅
+
+
+# Check for conflicting rewrite rules
+wp eval '
+global $wp_rewrite;
+$rules = get_option("rewrite_rules");
+$fr_rules = array_filter(array_keys($rules), fn($k) => strpos($k, "^fr/") === 0);
+echo count($fr_rules) . " rules start with ^fr/\n";
+foreach (array_slice($fr_rules, 0, 10) as $rule) {
+    echo "  $rule → " . $rules[$rule] . "\n";
+}
+'
+
+
+
+
+
+
+
+Step 2 — Fixed the Nginx configuration to correctly route language-prefixed URLs:
+
+nginx# /etc/nginx/sites-available/clientsite.conf
+server {
+    listen 443 ssl;
+    server_name clientsite.com;
+    root /var/www/html;
+    index index.php;
+
+    # WPML language-prefixed URLs — must be handled before the generic try_files
+    # Without this, /fr/ and /de/ paths 404 at server level before reaching WordPress
+    location ~ ^/(fr|de)(/.*)?$ {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    # Default WordPress routing
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    # PHP processing
+    location ~ \.php$ {
+        include       fastcgi_params;
+        fastcgi_pass  unix:/run/php/php8.1-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+
+        # Pass the original URI to PHP so WPML can detect the language prefix
+        fastcgi_param REQUEST_URI $request_uri;
+    }
+}
+
+
+
+
+
+Step 3 — Cleared all WPML language cookies and enforced URL-only language detection:
+
+php// functions.php — Force URL-based language detection, ignore cookies
+// This prevents beta-test residual cookies from overriding the URL language
+
+add_filter('wpml_ls_languages', function($languages) {
+    return $languages; // Keep language switcher intact
+});
+
+// Force WPML to use URL as the ONLY language source — ignore cookies and browser
+add_filter('wpml_language_is_from_browser', '__return_false');
+add_filter('wpml_use_cookies_for_language', '__return_false');
+
+// Also clear any stale WPML language cookies on every request
+add_action('init', function() {
+    $wpml_cookie_name = '_icl_current_language';
+    if (isset($_COOKIE[$wpml_cookie_name])) {
+        // Expire the cookie immediately — force URL-based detection
+        setcookie($wpml_cookie_name, '', time() - 3600, COOKIEPATH, COOKIE_DOMAIN);
+        unset($_COOKIE[$wpml_cookie_name]);
+    }
+});
+
+
+
+
+
+
+
+
+Step 4 — Regenerated WooCommerce endpoint rewrite rules in the correct order with WPML:
+
+// functions.php — Ensure WooCommerce endpoints register AFTER WPML language filters
+// WooCommerce registers endpoints at priority 10 — WPML needs to be set up first
+
+// Delay WooCommerce endpoint registration until after WPML is ready
+remove_action('init', ['WC_Query', 'add_endpoints'], 10);
+add_action('init', ['WC_Query', 'add_endpoints'], 100); // After WPML at priority ~10
+
+// Force rewrite rules to regenerate with language prefix awareness
+add_action('init', function() {
+    if (get_option('wpml_rewrite_rules_version') !== WPML_VERSION) {
+        // WPML version changed — force full rewrite flush
+        flush_rewrite_rules(true);
+        update_option('wpml_rewrite_rules_version', WPML_VERSION);
+    }
+}, 200); // Very late — after both WooCommerce and WPML have registered everything
+
+
+
+
+
+
+
+
+Step 5 — Built a multilingual URL routing validator to audit all language variants:
+
+
+php// multilingual-url-audit.php — Run via: wp eval-file multilingual-url-audit.php
+
+$languages   = apply_filters('wpml_active_languages', null, ['skip_missing' => 0]);
+$test_posts  = get_posts(['numberposts' => 5, 'post_type' => 'product', 'fields' => 'ids']);
+$issues      = [];
+
+echo "Multilingual URL Routing Audit\n";
+echo str_repeat('=', 60) . "\n\n";
+
+foreach ($test_posts as $post_id) {
+    echo "Product ID: $post_id — " . get_the_title($post_id) . "\n";
+
+    foreach ($languages as $lang_code => $lang) {
+        // Get the translated URL for this post in this language
+        $translated_id  = apply_filters('wpml_object_id', $post_id, 'product', true, $lang_code);
+        $translated_url = get_permalink($translated_id);
+
+        $response = wp_remote_head($translated_url, [
+            'timeout'  => 8,
+            'sslverify' => false,
+            // Don't follow redirects — we want to see if the URL itself is correct
+            'redirection' => 0,
+        ]);
+
+        $code    = is_wp_error($response) ? 'ERR' : wp_remote_retrieve_response_code($response);
+        $status  = $code === 200 ? '✅' : ($code === 301 || $code === 302 ? '↪️ ' : '❌');
+
+        printf(
+            "  %s [%s] HTTP %-3s → %s\n",
+            $status,
+            strtoupper($lang_code),
+            $code,
+            $translated_url
+        );
+
+        if ($code !== 200) {
+            $issues[] = "[{$lang_code}] $translated_url returned HTTP $code";
+        }
+    }
+    echo "\n";
+}
+
+if (!empty($issues)) {
+    echo count($issues) . " routing issues found:\n";
+    foreach ($issues as $issue) echo "  ⚠️  $issue\n";
+} else {
+    echo "All multilingual URLs routing correctly. ✅\n";
+}
+
+
+
+
+
+
+Step 6 — Added language-aware canonical URL tags to prevent search engines from indexing wrong-language pages:
+
+// functions.php — Ensure canonical URLs reflect the correct language
+add_action('wp_head', function() {
+    if (!function_exists('apply_filters')) return;
+
+    $current_lang = apply_filters('wpml_current_language', null);
+    $current_url  = apply_filters('wpml_permalink', get_permalink(), $current_lang);
+
+    if ($current_url) {
+        echo '<link rel="canonical" href="' . esc_url($current_url) . '" />' . "\n";
+    }
+
+    // Add hreflang tags for all language variants
+    $languages = apply_filters('wpml_active_languages', null, ['skip_missing' => 0]);
+    
+    foreach ($languages as $lang_code => $lang) {
+        $translated_url = apply_filters('wpml_permalink', get_permalink(), $lang_code);
+        $hreflang       = $lang_code === 'en' ? 'en' : $lang_code; // adjust as needed
+        echo '<link rel="alternate" hreflang="' . esc_attr($hreflang)
+           . '" href="' . esc_url($translated_url) . '" />' . "\n";
+    }
+    // x-default points to the default language (English)
+    $default_url = apply_filters('wpml_permalink', get_permalink(), 'en');
+    echo '<link rel="alternate" hreflang="x-default" href="' . esc_url($default_url) . '" />' . "\n";
+}, 1);
+
+
+
+
+
+Multilingual routing accuracy went from 70% correct to 100% correct across all three languages. WooCommerce checkout in all three languages worked flawlessly. Google Search Console showed correct hreflang attribution within 48 hours of the fix. 
+
+
+
+
+
+
+
+

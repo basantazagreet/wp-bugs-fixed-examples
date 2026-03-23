@@ -1,0 +1,97 @@
+Bug Title / Short Description (one liner) :  "Posts are duplicating on our blog archive pages when we go to page 2 or 3"
+Bug category: Database & Query Layer
+
+
+Description: 
+A publishing client noticed that their paginated blog archive was showing the same posts on multiple pages — posts from page 1 would reappear on page 2, and page 3 showed a mix of old and new posts. This was causing SEO issues (duplicate content) and confusing readers.
+
+
+Main Cause:
+The theme's functions.php had a pre_get_posts filter that was modifying the main query's orderby parameter to include a secondary sort by a custom meta field (_featured_weight). Because some posts had no value for _featured_weight, MySQL was ordering NULL values inconsistently across paginated queries — meaning the order shifted between pages, causing posts to appear on multiple pages or be skipped entirely.
+
+
+What We Did:
+
+
+Step 1 — Reproduced and confirmed the issue with a debug query:
+
+// functions.php — Temporarily log the actual SQL being run
+add_filter('posts_request', function($sql, $query) {
+    if ($query->is_main_query() && $query->is_archive()) {
+        error_log('Archive SQL: ' . $sql);
+    }
+    return $sql;
+}, 10, 2);
+
+
+
+// Log revealed:
+// ORDER BY wp_postmeta.meta_value+0 DESC, wp_posts.post_date DESC
+// LIMIT 10 OFFSET 10
+// — meta_value NULL rows shuffled between pages
+
+
+
+Step 2 — Fixed the pre_get_posts to handle NULL meta values explicitly:
+
+// functions.php — BEFORE (broken ordering)
+add_action('pre_get_posts', function($query) {
+    if ($query->is_main_query() && $query->is_home()) {
+        $query->set('meta_key', '_featured_weight');
+        $query->set('orderby', 'meta_value_num');
+        $query->set('order', 'DESC');
+    }
+});
+
+
+// functions.php — AFTER (stable ordering with NULL handling)
+add_action('pre_get_posts', function($query) {
+    if (!$query->is_main_query() || !$query->is_home()) return;
+
+    // Don't filter by meta_key (excludes posts without the meta)
+    // Instead use a posts_clauses filter to LEFT JOIN and COALESCE NULLs
+    $query->set('orderby', ['meta_value_num' => 'DESC', 'date' => 'DESC']);
+});
+
+
+
+// Handle NULL meta values with COALESCE so ordering is always deterministic
+add_filter('posts_clauses', function($clauses, $query) {
+    if (!$query->is_main_query() || !$query->is_home()) return $clauses;
+
+    global $wpdb;
+
+    // LEFT JOIN instead of INNER JOIN so posts without meta are included
+    $clauses['join'] .= " LEFT JOIN {$wpdb->postmeta} AS featured_meta
+        ON ({$wpdb->posts}.ID = featured_meta.post_id
+        AND featured_meta.meta_key = '_featured_weight')";
+
+    // COALESCE NULL to 0 so ordering is consistent
+    $clauses['orderby'] = "COALESCE(featured_meta.meta_value + 0, 0) DESC,
+                           {$wpdb->posts}.post_date DESC";
+
+    return $clauses;
+}, 10, 2);
+
+
+
+Step 3 — Added a unique tiebreaker to guarantee stable pagination:
+
+// The secondary sort by post_date + ID ensures no two rows ever tie
+// which is the root cause of pagination instability in all cases
+
+add_filter('posts_clauses', function($clauses, $query) {
+    if (!$query->is_main_query() || !$query->is_archive()) return $clauses;
+    global $wpdb;
+    // Append post ID as absolute tiebreaker
+    if (strpos($clauses['orderby'], $wpdb->posts . '.ID') === false) {
+        $clauses['orderby'] .= ", {$wpdb->posts}.ID DESC";
+    }
+    return $clauses;
+}, 99, 2);
+
+
+
+Pagination was stable across all archive pages with zero duplicate posts. 
+
+

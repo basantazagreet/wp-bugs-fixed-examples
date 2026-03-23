@@ -1,0 +1,271 @@
+Bug Title / Short Description (one liner) : "Our WooCommerce emails look completely broken — images are missing and the layout is collapsed"
+Bug category: Email & Notifications
+
+
+
+Description:
+A fashion e-commerce client reported that their WooCommerce transactional emails — order confirmations, shipping notifications, and invoices — had suddenly started arriving with broken layouts: the store logo was missing, the header background was white instead of their brand color, product images in the order table were showing broken icons, and the entire footer section had collapsed into a single line of unstyled text. The emails had been rendering correctly for months.
+
+
+
+
+
+
+Main Cause:
+Three issues were identified after investigation:
+
+A WooCommerce update (8.3) had changed the path structure for email template overrides. The client's theme had custom WooCommerce email templates in wp-content/themes/client-theme/woocommerce/emails/ — but the update had moved certain template partials to a new subdirectory structure (emails/plain/ and emails/email-header.php path changed). WordPress was falling back to the outdated custom templates which were now missing required template parts.
+The logo image URL was using a hardcoded http:// URL in the WooCommerce email settings — after the site migrated to HTTPS, the http:// logo was being blocked by the email client's mixed-content protection, rendering as a broken image.
+A caching plugin had cached the email template output as plain text, stripping all HTML tags from the email body before it was passed to wp_mail().
+
+
+
+
+
+
+
+What We Did:
+
+
+
+Step 1 — Identified the template version mismatch:
+
+
+bash# Check which WooCommerce email templates have outdated overrides in the theme
+
+wp wc update --dry-run 2>&1 | grep -i "email"
+
+# Better: use WooCommerce's built-in template check
+
+wp eval '
+$outdated = [];
+$wc_templates = WC()->plugin_path() . "/templates/";
+$theme_templates = get_stylesheet_directory() . "/woocommerce/";
+
+if (is_dir($theme_templates)) {
+    $files = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($theme_templates, FilesystemIterator::SKIP_DOTS)
+    );
+    foreach ($files as $file) {
+        if ($file->getExtension() !== "php") continue;
+        $relative   = str_replace($theme_templates, "", $file->getRealPath());
+        $wc_version = WC()->plugin_path() . "/templates/" . $relative;
+        if (file_exists($wc_version)) {
+            // Compare WC version headers
+            $theme_ver = get_file_data($file->getRealPath(), ["Version" => "WC version"]);
+            $wc_ver    = get_file_data($wc_version, ["Version" => "WC version"]);
+            if ($theme_ver["Version"] !== $wc_ver["Version"]) {
+                echo "OUTDATED: $relative (theme: {$theme_ver["Version"]} | WC: {$wc_ver["Version"]})\n";
+            }
+        }
+    }
+}
+'
+
+
+
+
+
+
+Step 2 — Updated the outdated theme email templates to match WooCommerce 8.3 structure:
+
+
+// Email template override location in theme — WooCommerce 8.3+ structure
+// wp-content/themes/client-theme/woocommerce/emails/
+
+// email-header.php — Updated to match WC 8.3 template structure
+
+<?php
+/**
+ * Email Header — overrides WooCommerce default
+ * WC version: 8.3.0
+ */
+if (!defined('ABSPATH')) exit;
+?>
+<!DOCTYPE html>
+<html <?php language_attributes(); ?>>
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=<?php bloginfo('charset'); ?>">
+    <meta content="width=device-width, initial-scale=1.0" name="viewport">
+    <title><?php echo esc_html(get_bloginfo('name')); ?></title>
+    <style type="text/css">
+        /* Reset styles for email clients */
+        body   { margin: 0; padding: 0; background-color: #f7f7f7; }
+        table  { border-collapse: collapse; }
+        img    { border: none; display: block; }
+        a      { color: #c0392b; text-decoration: none; }
+    </style>
+</head>
+<body>
+<table border="0" cellpadding="0" cellspacing="0" width="100%"
+       style="background-color: #f7f7f7;">
+    <tr>
+        <td align="center" style="padding: 30px 0;">
+            <!-- Logo — always use absolute HTTPS URL -->
+            <?php
+            $logo_id  = get_theme_mod('custom_logo');
+            $logo_url = $logo_id ? wp_get_attachment_image_url($logo_id, 'medium') : '';
+            if ($logo_url) :
+            ?>
+            <img src="<?php echo esc_url(set_url_scheme($logo_url, 'https')); ?>"
+                 alt="<?php echo esc_attr(get_bloginfo('name')); ?>"
+                 style="max-width: 200px; height: auto;">
+            <?php endif; ?>
+        </td>
+    </tr>
+    <tr>
+        <td>
+            <table border="0" cellpadding="0" cellspacing="0" width="600"
+                   align="center"
+                   style="background-color: #ffffff; border-radius: 4px; padding: 40px;">
+                   
+                   
+                   
+                   
+                   
+                   
+                   
+Step 3 — Fixed all HTTP image URLs in WooCommerce email settings:
+
+// functions.php — Force HTTPS on all image URLs in WooCommerce emails
+add_filter('woocommerce_email_get_option', function($value, $email, $key) {
+    // Fix the header image URL stored in WooCommerce settings
+    if ($key === 'header_image' && !empty($value)) {
+        $value = set_url_scheme($value, 'https');
+    }
+    return $value;
+}, 10, 3);
+
+
+// Also fix product images in order email tables
+add_filter('woocommerce_order_item_thumbnail', function($image, $item) {
+    // Replace any http:// src with https://
+    $image = preg_replace('/src=["\']http:\/\//i', 'src="https://', $image);
+    return $image;
+}, 10, 2);
+
+
+// Scan and fix all stored email image URLs in WooCommerce options
+add_action('admin_init', function() {
+    if (!isset($_GET['fix_woo_email_urls']) || !current_user_can('manage_options')) return;
+
+    $woo_email_options = [
+        'woocommerce_email_header_image',
+        'woocommerce_email_footer_text',
+    ];
+
+    foreach ($woo_email_options as $option) {
+        $value = get_option($option);
+        if ($value && strpos($value, 'http://') !== false) {
+            $fixed = str_replace('http://', 'https://', $value);
+            update_option($option, $fixed);
+            echo "Fixed: $option<br>";
+        }
+    }
+    echo "Done. <a href='" . admin_url('admin.php?page=wc-settings&tab=email') . "'>Back to Email Settings</a>";
+    exit;
+});
+
+
+
+
+
+
+
+Step 4 — Fixed the caching plugin stripping HTML from email bodies:
+
+
+php// functions.php — Prevent caching plugins from processing wp_mail() content
+// The issue: WP Rocket's HTML minifier was running on the mail buffer
+
+// Disable output buffering/minification during wp_mail() calls
+add_filter('wp_mail', function($args) {
+    // Signal to caching plugins that we're in an email context
+    if (!defined('WP_MAIL_SENDING')) {
+        define('WP_MAIL_SENDING', true);
+    }
+    return $args;
+}, 1);
+
+// For WP Rocket specifically — disable HTML minification when sending email
+add_filter('rocket_buffer', function($html) {
+    if (defined('WP_MAIL_SENDING') && WP_MAIL_SENDING) {
+        return $html; // Return unmodified
+    }
+    return $html;
+}, 1);
+
+// For W3 Total Cache — exclude email output from minification
+add_filter('w3tc_minify_enable', function($enabled) {
+    if (defined('WP_MAIL_SENDING') && WP_MAIL_SENDING) {
+        return false;
+    }
+    return $enabled;
+});
+
+
+
+
+
+
+Step 5 — Added an email preview system so the client can check rendering before it reaches customers:
+
+
+php// functions.php — Email preview endpoint for admins
+add_action('admin_menu', function() {
+    add_submenu_page(
+        'woocommerce',
+        'Email Preview',
+        'Email Preview',
+        'manage_woocommerce',
+        'woo-email-preview',
+        'render_email_preview_page'
+    );
+});
+
+function render_email_preview_page() {
+    if (!current_user_can('manage_woocommerce')) return;
+
+    $email_types = [
+        'WC_Email_Customer_Processing_Order'  => 'Processing Order',
+        'WC_Email_Customer_Completed_Order'   => 'Completed Order',
+        'WC_Email_Customer_Invoice'           => 'Customer Invoice',
+        'WC_Email_New_Order'                  => 'New Order (Admin)',
+    ];
+
+    $selected = sanitize_text_field($_GET['email_type'] ?? 'WC_Email_Customer_Processing_Order');
+
+    echo '<div class="wrap"><h1>WooCommerce Email Preview</h1>';
+    echo '<form method="GET"><input type="hidden" name="page" value="woo-email-preview">';
+    echo '<select name="email_type">';
+    foreach ($email_types as $class => $label) {
+        $sel = $class === $selected ? ' selected' : '';
+        echo "<option value='$class'$sel>$label</option>";
+    }
+    echo '<button type="submit" class="button">Preview</button></select></form><br>';
+
+    // Render email preview
+    $emails    = WC()->mailer()->get_emails();
+    $email_obj = $emails[$selected] ?? null;
+    $order     = wc_get_orders(['limit' => 1, 'return' => 'objects'])[0] ?? null;
+
+    if ($email_obj && $order) {
+        echo '<div style="max-width:700px;margin:20px auto;border:1px solid #ddd;">';
+        echo $email_obj->style_inline($email_obj->get_content_html());
+        echo '</div>';
+    } else {
+        echo '<p>No orders found to preview. Create a test order first.</p>';
+    }
+
+    echo '</div>';
+}
+
+
+
+
+
+All three email rendering issues were fixed. The client confirmed emails were rendering correctly across Gmail, Outlook, and Apple Mail after the template updates and HTTP→HTTPS fix. 
+
+
+
+

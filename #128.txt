@@ -1,0 +1,261 @@
+Bug Title / Short Description (one liner) : "Our wp-config.php constants are set correctly but WordPress keeps ignoring them"
+Bug category: Core Settings & Options API
+
+ 
+
+Description: 
+A development agency had set up a staging environment for a client site and configured wp-config.php with WP_DEBUG => true, WP_CACHE => false, and custom database credentials. The staging site was behaving identically to production — caching was active, debug mode was off, and it appeared to be hitting the production database — despite the wp-config.php constants being explicitly set to staging values.
+
+
+
+Main Cause:
+The server was running a WordPress Must-Use (MU) plugin (wp-content/mu-plugins/environment-config.php) that had been deployed by the hosting company's control panel. This MU plugin was overriding all environment constants using define() — but because PHP's define() silently fails when a constant is already defined, the order of loading was reversed from what the agency expected.
+
+MU plugins load before functions.php but more critically, the MU plugin was using wp_config_values option from the database to re-apply settings, overwriting constants that had already been set in wp-config.php. The WP_CACHE constant in particular was being ignored because a page cache plugin was reading it at a point in the WordPress bootstrap where the MU plugin had already re-enabled caching via wp_cache_add_global_groups().
+Additionally, the agency had added define('DB_NAME', 'staging_db') after the require_once ABSPATH . 'wp-settings.php' line in wp-config.php — which is too late, as the database connection is established during wp-settings.php load.
+
+
+
+
+
+
+What We Did:
+
+
+
+Step 1 — Diagnosed constant loading order with a bootstrap trace:
+
+// wp-config.php — Temporary diagnostic to trace constant definition points
+// Add BEFORE all other defines
+
+define('WP_DEBUG', true);
+define('WP_DEBUG_LOG', true);
+define('WP_DEBUG_DISPLAY', false);
+
+
+// After each critical define, log who set it and when
+$_constant_trace = [];
+
+
+// Wrap defines in a tracking function
+function tracked_define($name, $value) {
+    if (!defined($name)) {
+        define($name, $value);
+        $GLOBALS['_constant_trace'][$name] = [
+            'value' => $value,
+            'set_by' => 'wp-config.php',
+            'trace' => debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 3),
+        ];
+    } else {
+        $GLOBALS['_constant_trace'][$name . '_IGNORED'] = [
+            'attempted_value' => $value,
+            'existing_value'  => constant($name),
+            'note'            => 'Already defined — this define() was silently ignored',
+        ];
+    }
+}
+
+// Then in wp-content/mu-plugins/ — log when MU plugins fire
+add_action('muplugins_loaded', function() {
+    error_log('MU plugins loaded. Constant states: ' . print_r([
+        'WP_DEBUG'   => defined('WP_DEBUG')   ? WP_DEBUG   : 'NOT DEFINED',
+        'WP_CACHE'   => defined('WP_CACHE')   ? WP_CACHE   : 'NOT DEFINED',
+        'DB_NAME'    => defined('DB_NAME')     ? DB_NAME    : 'NOT DEFINED',
+    ], true));
+});
+
+
+
+
+
+
+
+
+
+Step 2 — Fixed constant placement in wp-config.php — all define() calls must come before wp-settings.php:
+
+
+// wp-config.php — CORRECT ordering of all constants
+
+// ============================================================
+// ENVIRONMENT DETECTION — must be absolute first
+// ============================================================
+$environment = getenv('WP_ENV') ?: 'production';
+
+
+// ============================================================
+// DATABASE — must be defined BEFORE wp-settings.php loads
+// ============================================================
+if ($environment === 'staging') {
+    define('DB_NAME',     'staging_db');
+    define('DB_USER',     'staging_user');
+    define('DB_PASSWORD', 'staging_password');
+    define('DB_HOST',     'localhost');
+} else {
+    define('DB_NAME',     'production_db');
+    define('DB_USER',     'production_user');
+    define('DB_PASSWORD', 'production_password');
+    define('DB_HOST',     'localhost');
+}
+
+define('DB_CHARSET', 'utf8mb4');
+define('DB_COLLATE', '');
+
+
+// ============================================================
+// DEBUG — must be defined BEFORE wp-settings.php loads
+// ============================================================
+if ($environment === 'staging' || $environment === 'development') {
+    define('WP_DEBUG',         true);
+    define('WP_DEBUG_LOG',     true);
+    define('WP_DEBUG_DISPLAY', false); // Log to file, not screen
+    define('SCRIPT_DEBUG',     true);  // Use unminified scripts
+    define('SAVEQUERIES',      true);  // Log DB queries
+} else {
+    define('WP_DEBUG',         false);
+    define('WP_DEBUG_LOG',     false);
+    define('WP_DEBUG_DISPLAY', false);
+}
+
+
+
+// ============================================================
+// CACHE — defined before wp-settings.php
+// ============================================================
+define('WP_CACHE', $environment === 'production');
+
+// ============================================================
+// URL SETTINGS — must match actual environment
+// ============================================================
+if ($environment === 'staging') {
+    define('WP_HOME',    'https://staging.clientsite.com');
+    define('WP_SITEURL', 'https://staging.clientsite.com');
+}
+
+// ============================================================
+// SECURITY KEYS — unique per environment
+// ============================================================
+if ($environment === 'staging') {
+    define('AUTH_KEY',         'staging-unique-key-1');
+    define('SECURE_AUTH_KEY',  'staging-unique-key-2');
+    define('LOGGED_IN_KEY',    'staging-unique-key-3');
+    define('NONCE_KEY',        'staging-unique-key-4');
+    define('AUTH_SALT',        'staging-unique-key-5');
+    define('SECURE_AUTH_SALT', 'staging-unique-key-6');
+    define('LOGGED_IN_SALT',   'staging-unique-key-7');
+    define('NONCE_SALT',       'staging-unique-key-8');
+} else {
+    // Production keys from https://api.wordpress.org/secret-key/1.1/salt/
+    define('AUTH_KEY',         'production-key-here');
+    // ...etc
+}
+
+// ============================================================
+// THIS MUST BE LAST — loads WordPress after all constants set
+// ============================================================
+require_once ABSPATH . 'wp-settings.php';
+
+
+
+
+
+
+
+
+
+
+Step 3 — Removed the conflicting MU plugin or made it environment-aware:
+
+// wp-content/mu-plugins/environment-config.php — Fixed MU plugin
+
+// Use defined() checks before every define() to respect wp-config.php values
+if (!defined('WP_DEBUG')) {
+    define('WP_DEBUG', false); // Only set if not already defined by wp-config.php
+}
+
+if (!defined('WP_CACHE')) {
+    define('WP_CACHE', true); // Only set if not already defined
+}
+
+// NEVER override DB_ constants in an MU plugin — these must come from wp-config.php
+// because the DB connection is established before MU plugins even load
+
+
+
+
+
+
+
+
+Step 4 — Added an environment indicator to the admin bar for clear environment awareness:
+
+// functions.php — Show current environment in admin bar
+add_action('admin_bar_menu', function($wp_admin_bar) {
+    if (!is_admin_bar_showing()) return;
+
+    $environment = getenv('WP_ENV') ?: 'production';
+    $colors = [
+        'production'  => '#dc3545', // Red — danger, be careful
+        'staging'     => '#fd7e14', // Orange — test environment
+        'development' => '#28a745', // Green — safe to experiment
+    ];
+    $color = $colors[$environment] ?? '#6c757d';
+
+    $wp_admin_bar->add_node([
+        'id'    => 'environment-indicator',
+        'title' => '<span style="color:' . $color . ';font-weight:bold;text-transform:uppercase;">'
+                 . '● ' . esc_html($environment) . '</span>',
+        'href'  => false,
+        'meta'  => ['title' => 'Current environment: ' . $environment],
+    ]);
+}, 999);
+
+
+
+
+
+
+
+Step 5 — Set the WP_ENV variable at the server level so it can never be accidentally wrong:
+
+apache# Apache — /etc/apache2/sites-available/staging.conf
+<VirtualHost *:443>
+    ServerName staging.clientsite.com
+    SetEnv WP_ENV staging
+    # ...rest of config
+</VirtualHost>
+nginx# Nginx — /etc/nginx/sites-available/staging.conf
+server {
+    server_name staging.clientsite.com;
+    fastcgi_param WP_ENV staging;
+    # ...rest of config
+}
+
+
+
+
+
+
+
+The staging environment immediately started using the correct database, debug settings, and cache configuration. The agency moved to this pattern for all client deployments. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Main Cause:
+
+
+What we Did:

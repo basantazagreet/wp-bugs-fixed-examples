@@ -1,0 +1,232 @@
+👤 Client 5 — "WooCommerce updated from 7.x to 8.x and now checkout is completely broken — we can't roll back"
+
+
+
+🐛 The Problem
+A high-revenue WooCommerce store client had enabled automatic plugin updates. Overnight, WooCommerce auto-updated from version 7.9.0 to 8.0.0 — a major version jump with breaking changes. By morning, the checkout page was returning a blank white screen, no orders were being processed, and the client had lost an estimated $14,000 in overnight sales. When they tried to roll back using their backup plugin, they discovered the automated backup had also been configured to run at 3 AM — and had captured the post-update broken state rather than the pre-update working state.
+
+
+
+
+🔍 Root Cause
+WooCommerce 8.0 introduced the High-Performance Order Storage (HPOS) system as the default, replacing the legacy wp_posts-based order storage. The transition required a database migration. The site had three custom plugins that:
+
+Queried orders directly using $wpdb->posts and $wpdb->postmeta with hardcoded table names — not using wc_get_orders() or WooCommerce's CRUD API
+Used deprecated WooCommerce hooks (woocommerce_process_checkout) removed in 8.0
+Expected $order->post to be a WP_Post object — in HPOS mode, $order->post is null
+
+All three plugins were loaded during checkout, and the first fatal error (null $order->post) triggered a cascade that prevented the checkout from completing.
+
+
+
+
+
+🛠 What I Did
+
+
+Step 1 — Immediately disabled HPOS to restore legacy order storage compatibility:
+
+php// functions.php — Emergency: force WooCommerce back to legacy order storage
+// This is a stopgap — gives us time to fix the real compatibility issues
+
+add_filter('woocommerce_feature_hpos_enabled', '__return_false');
+
+// Also disable the HPOS migration prompt so it doesn't auto-start again
+add_filter('woocommerce_hpos_auto_migration', '__return_false');
+
+This immediately restored checkout functionality while we worked on the permanent fix.
+
+
+
+
+
+
+
+
+Step 2 — Identified and fixed all three broken custom plugins:
+
+// Fix 1 — Replace direct wp_posts queries with WooCommerce CRUD API
+
+// BEFORE — Broken in HPOS mode: queries legacy posts table directly
+
+global $wpdb;
+$orders = $wpdb->get_results("
+    SELECT ID, post_status, post_date
+    FROM {$wpdb->posts}
+    WHERE post_type   = 'shop_order'
+    AND   post_status = 'wc-processing'
+    ORDER BY post_date DESC
+    LIMIT 20
+");
+
+// AFTER — HPOS-compatible: uses WooCommerce's order query API
+$orders = wc_get_orders([
+    'status'     => 'processing',
+    'limit'      => 20,
+    'orderby'    => 'date',
+    'order'      => 'DESC',
+    'return'     => 'objects',
+]);
+
+
+// -------------------------------------------------------
+
+// Fix 2 — Replace removed hooks with WooCommerce 8.x equivalents
+
+
+// BEFORE — Hook removed in WooCommerce 8.0:
+add_action('woocommerce_process_checkout', 'my_checkout_handler');
+
+
+// AFTER — Use the replacement hook:
+add_action('woocommerce_checkout_process', 'my_checkout_handler');
+// Or for order creation:
+add_action('woocommerce_checkout_order_created', function($order) {
+    // $order is now a WC_Order object — use CRUD methods
+    $order_id = $order->get_id();
+    $total    = $order->get_total();
+});
+
+
+
+// -------------------------------------------------------
+
+// Fix 3 — Replace $order->post access with WC_Order CRUD methods
+
+// BEFORE — Fatal in HPOS: $order->post is null in HPOS mode
+function get_order_custom_field($order_id) {
+    $order      = wc_get_order($order_id);
+    $post       = $order->post; // NULL in HPOS — Fatal: Cannot access property on null
+    $meta_value = get_post_meta($post->ID, '_custom_field', true);
+    return $meta_value;
+}
+
+// AFTER — HPOS-compatible: use WC_Order methods only
+function get_order_custom_field($order_id) {
+    $order = wc_get_order($order_id);
+    if (!$order) return null;
+    // WC_Order::get_meta() works in both legacy AND HPOS modes
+    return $order->get_meta('_custom_field', true);
+}
+
+
+
+
+
+
+
+
+
+Step 3 — Recovered the pre-update database state from server-level backups:
+
+bash# Check hosting provider's server-level backup timestamps
+# (Most managed hosts keep 24h rolling snapshots independent of WordPress backup plugins)
+
+# Identify the last backup before the WooCommerce update
+# WooCommerce updated at approximately 3:14 AM
+# Hosting backup runs at 3:00 AM — the 3:00 AM backup captured the WORKING state
+
+# Request point-in-time restore of wp_wc_orders table from hosting provider
+# (HPOS creates its own tables — these need to be from before the migration ran)
+
+# Alternatively — use binary log to find exact update timestamp
+mysqlbinlog /var/log/mysql/mysql-bin.000042 \
+    --start-datetime="2024-01-15 03:00:00" \
+    --stop-datetime="2024-01-15 04:00:00" \
+    | grep -A5 "wc_orders"
+    
+    
+    
+    
+    
+    
+    
+    
+    
+Step 4 — Implemented a major-version update guard to prevent auto-updates across major version boundaries:
+
+// functions.php — Block auto-updates that cross major version boundaries
+add_filter('auto_update_plugin', function($update, $item) {
+    if (!isset($item->slug) || $item->slug !== 'woocommerce') return $update;
+    if (!isset($item->new_version))                            return $update;
+
+    // Get currently installed version
+    $plugin_data    = get_plugin_data(WP_PLUGIN_DIR . '/woocommerce/woocommerce.php');
+    $current        = $plugin_data['Version'] ?? '0';
+    $current_major  = (int) explode('.', $current)[0];
+    $new_major      = (int) explode('.', $item->new_version)[0];
+
+    if ($new_major > $current_major) {
+        // Major version jump — block auto-update and alert admin for manual review
+        wp_mail(
+            get_option('admin_email'),
+            "🚨 WooCommerce Major Update Blocked — Manual Review Required",
+            sprintf(
+                "WooCommerce auto-update was blocked.\n\n" .
+                "Current version: %s (major: %d)\n" .
+                "Available version: %s (major: %d)\n\n" .
+                "Major WooCommerce updates may include breaking changes.\n" .
+                "Please:\n" .
+                "1. Review the WooCommerce 8.x changelog\n" .
+                "2. Test on staging first\n" .
+                "3. Create a full backup\n" .
+                "4. Update manually during a low-traffic window\n\n" .
+                "Update manually: %s",
+                $current,      $current_major,
+                $item->new_version, $new_major,
+                admin_url('update-core.php')
+            )
+        );
+        error_log("WooCommerce major update blocked: $current → {$item->new_version}");
+        return false; // Block the auto-update
+    }
+
+    return $update; // Allow minor/patch updates through
+}, 10, 2);
+
+
+
+
+
+
+
+
+
+
+
+Step 5 — Set up a staging-first update workflow with automated compatibility testing:
+
+// functions.php — WooCommerce update compatibility pre-check
+add_action('admin_notices', function() {
+    if (!current_user_can('update_plugins')) return;
+
+    $wc_data       = get_plugin_data(WP_PLUGIN_DIR . '/woocommerce/woocommerce.php');
+    $current       = $wc_data['Version'] ?? '0';
+    $update_info   = get_site_transient('update_plugins');
+    $wc_update     = $update_info->response['woocommerce/woocommerce.php'] ?? null;
+
+    if (!$wc_update) return;
+
+    $current_major = (int) explode('.', $current)[0];
+    $new_major     = (int) explode('.', $wc_update->new_version)[0];
+
+    if ($new_major > $current_major) {
+        echo '<div class="notice notice-warning"><p>';
+        printf(
+            '<strong>⚠️ WooCommerce Major Update Available:</strong> %s → %s. ' .
+            'This is a <strong>major version update</strong> and may contain breaking changes. ' .
+            '<a href="%s" target="_blank">Review changelog</a> and test on staging before updating. ' .
+            '<strong>Do not enable auto-update for major versions.</strong>',
+            esc_html($current),
+            esc_html($wc_update->new_version),
+            'https://developer.woocommerce.com/changelog/'
+        );
+        echo '</p></div>';
+    }
+});
+
+
+
+
+
+Checkout was restored within 45 minutes of the emergency HPOS disable. All three custom plugins were fully patched for HPOS compatibility over the following 3 days on staging. The major-version auto-update guard was deployed across all 9 WooCommerce sites the agency manages. The client recovered $9,200 of the $14,000 lost window through manual order entry from abandoned cart emails. 

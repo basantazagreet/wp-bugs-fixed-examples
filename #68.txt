@@ -1,0 +1,128 @@
+Bug Title / Short Description (one liner) :  "Our custom fields are disappearing every time we update a post"
+Bug category: Post, Page & Content Editor
+
+Description: 
+A news publisher running a custom editorial workflow reported that custom meta fields — including _author_bio, _article_source, _editorial_status, and _seo_override — were being wiped clean every time any editor updated a post, even if they didn't touch those fields. The meta box displayed on the post edit screen but showed empty after any save.
+
+
+
+Main Cause:
+A recently installed editorial workflow plugin had registered a save_post hook without a proper nonce check or capability gate. Inside that hook, it was calling update_post_meta() on a predefined list of meta keys — and the list was too broad, using a wildcard match that accidentally included all meta keys starting with _ (the WordPress convention for hidden/custom meta). It was overwriting all protected meta fields with empty strings on every save.
+
+
+// The culprit code found inside the editorial plugin:
+add_action('save_post', function($post_id) {
+    // No nonce check, no capability check
+    // Iterates ALL $_POST keys starting with '_' and saves them
+    foreach ($_POST as $key => $value) {
+        if (substr($key, 0, 1) === '_') {
+            // Saves empty string when field not in the form — wiping existing data
+            update_post_meta($post_id, sanitize_key($key), sanitize_text_field($value));
+        }
+    }
+});
+
+
+
+
+
+What We Did:
+
+
+
+Step 1 — Confirmed the culprit with meta change logging:
+
+// functions.php — Temporarily log all meta updates on save
+add_action('updated_post_meta', function($meta_id, $post_id, $meta_key, $meta_value) {
+    error_log("Meta updated: post=$post_id key=$meta_key value=" . substr($meta_value, 0, 50));
+}, 10, 4);
+
+add_action('deleted_post_meta', function($meta_ids, $post_id, $meta_key) {
+    error_log("Meta DELETED: post=$post_id key=$meta_key");
+}, 10, 3);
+Log confirmed the editorial plugin was deleting all custom meta on every save event.
+
+
+
+
+Step 2 — Patched the editorial plugin's save_post hook with a proper allowlist approach:
+
+
+// editorial-plugin/plugin.php — Safe replacement
+
+// Remove the dangerous broad hook
+remove_action('save_post', 'editorial_save_all_meta');
+
+// Replace with a strict allowlist-only save
+add_action('save_post', function($post_id) {
+
+    // 1. Verify nonce
+    if (!isset($_POST['editorial_nonce']) ||
+        !wp_verify_nonce($_POST['editorial_nonce'], 'editorial_save_' . $post_id)) {
+        return;
+    }
+
+    // 2. Verify capability
+    if (!current_user_can('edit_post', $post_id)) {
+        return;
+    }
+
+    // 3. Skip autosaves and revisions
+    if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) return;
+    if (wp_is_post_revision($post_id)) return;
+
+    // 4. Only save EXPLICITLY declared fields — never use wildcards
+    $allowed_fields = [
+        '_editorial_status' => 'sanitize_text_field',
+        '_editorial_notes'  => 'wp_kses_post',
+        '_assigned_editor'  => 'absint',
+        '_review_deadline'  => 'sanitize_text_field',
+    ];
+
+    foreach ($allowed_fields as $meta_key => $sanitizer) {
+        if (isset($_POST[$meta_key])) {
+            $value = call_user_func($sanitizer, $_POST[$meta_key]);
+            update_post_meta($post_id, $meta_key, $value);
+        }
+        // If field not in POST, do NOTHING — preserve existing value
+    }
+}, 10);
+
+
+
+
+
+
+Step 3 — Protected the publisher's critical meta fields with a safeguard hook:
+
+
+// functions.php — Protect specific meta keys from being emptied by any plugin
+$protected_meta_keys = [
+    '_author_bio',
+    '_article_source',
+    '_editorial_status',
+    '_seo_override',
+];
+
+
+add_filter('update_post_metadata', function($check, $post_id, $meta_key, $meta_value)
+    use ($protected_meta_keys) {
+    // Block any attempt to overwrite a populated field with an empty value
+    if (in_array($meta_key, $protected_meta_keys, true)) {
+        $existing = get_post_meta($post_id, $meta_key, true);
+        
+        if (!empty($existing) && empty($meta_value)) {
+            error_log("Blocked empty overwrite of protected meta: $meta_key on post $post_id");
+            return false; // Block the update
+        }
+    }
+    return $check; // Allow normal update
+}, 10, 4);
+
+
+
+All existing meta values were recovered from the most recent daily backup. No data was permanently lost. 
+
+
+
+

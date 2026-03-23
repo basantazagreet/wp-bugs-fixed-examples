@@ -1,0 +1,128 @@
+Bug Title / Short Description (one liner) : "Logged-in users are seeing other customers' names and cart data"
+Bug category: Plugin Compatibility & Integration
+
+
+Description: 
+This was the most critical bug we've handled. A membership site client reported that logged-in users were occasionally seeing other users' names, account details, and cart contents on the page — a serious privacy and data leak issue. The client was panicked and took the site offline immediately.
+
+
+Main Cause:
+The site was running WP Rocket (page caching) alongside WooCommerce and a membership plugin (MemberPress). WP Rocket's full-page cache was caching pages that contained personalized, user-specific content — including the wc-fragments (mini cart) and MemberPress account shortcodes. When a second user visited the same URL, they were served the cached HTML of the first user's session.
+The root issue: WP Rocket's cache exclusion rules for WooCommerce were configured, but the MemberPress account pages were not excluded, and a custom shortcode [mp_account_name] was being cached without any user-context awareness.
+
+
+
+What We Did:
+
+Step 1 — Immediate triage: Cleared ALL cache and put the site in maintenance mode within 10 minutes of being notified.
+
+ WP-CLI — immediately purge all cache layers
+ 
+wp cache flush
+wp rocket clean --confirm
+
+
+
+Step 2 — Identified uncached pages that should be excluded:
+
+// functions.php — Exclude all pages with personalized content from WP Rocket cache
+add_filter('rocket_exclude_pages', function($excluded_pages) {
+    $protected_pages = [
+        '/my-account/',
+        '/checkout/',
+        '/cart/',
+        '/member-dashboard/',
+        '/account-settings/',
+        '/login/',
+        '/logout/',
+    ];
+    return array_merge($excluded_pages, $protected_pages);
+});
+
+
+
+Step 3 — Added cache-busting for ANY page containing user-aware shortcodes:
+
+// functions.php — Disable caching entirely for logged-in users
+add_filter('do_rocket_generate_caching_files', function($do_cache) {
+    if (is_user_logged_in()) {
+        return false; // Never cache pages for logged-in users
+    }
+    return $do_cache;
+});
+
+
+
+
+Step 4 — Moved all personalized content to AJAX-loaded fragments so even if a page skeleton is cached, user data is always fetched fresh:
+
+// functions.php — Load account name via AJAX instead of inline shortcode
+add_action('wp_ajax_get_account_greeting', 'ajax_get_account_greeting');
+function ajax_get_account_greeting() {
+    if (!is_user_logged_in()) {
+        wp_send_json_error('Not logged in');
+    }
+    $user = wp_get_current_user();
+    wp_send_json_success([
+        'name'        => esc_html($user->display_name),
+        'member_since' => get_user_meta($user->ID, 'member_since', true),
+    ]);
+}
+
+
+// Enqueued JS — Replace static greeting with AJAX-fetched personalized data
+document.addEventListener('DOMContentLoaded', function() {
+    const greetingEl = document.querySelector('.account-greeting');
+    if (!greetingEl) return;
+
+    fetch('/wp-admin/admin-ajax.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'action=get_account_greeting&nonce=' + wpAjax.nonce,
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data.success) {
+            greetingEl.textContent = 'Welcome back, ' + data.data.name;
+        }
+    });
+});
+
+
+
+
+Step 5 — Set up automated cache audit alerts using a cron job to flag any cached pages containing user-specific strings:
+
+
+// functions.php — Weekly scan for potentially cached sensitive content
+add_action('wp_rocket_cache_audit', function() {
+    $cache_dir = WP_CONTENT_DIR . '/cache/wp-rocket/';
+    $dangerous_patterns = ['[mp_account', 'wc-account', 'display_name'];
+
+    // Alert admin if any cached file contains these patterns
+    foreach (glob($cache_dir . '**/*.html') as $file) {
+        $content = file_get_contents($file);
+        foreach ($dangerous_patterns as $pattern) {
+            if (strpos($content, $pattern) !== false) {
+                wp_mail(
+                    get_option('admin_email'),
+                    '⚠️ Cached file may contain user data: ' . basename($file),
+                    'File path: ' . $file
+                );
+            }
+        }
+    }
+});
+if (!wp_next_scheduled('wp_rocket_cache_audit')) {
+    wp_schedule_event(time(), 'weekly', 'wp_rocket_cache_audit');
+}
+
+
+
+
+
+The site was back online within 2 hours with zero data leakage. The client also filed the incident with their legal team as a precaution, and we provided a full technical report of the breach window and affected sessions.
+
+
+
+

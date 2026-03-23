@@ -1,0 +1,187 @@
+Bug Title / Short Description (one liner) :  "Our blog posts page is showing property listings and our properties page shows blog posts"
+Bug category: Permalinks & URL Routing
+
+Description: 
+A property portal client reported a bizarre routing bug — their blog page at clientsite.com/news/ was displaying property listings instead of blog posts, and clientsite.com/properties/ was showing blog post content. Both pages existed in the WordPress Pages list and the content was correct in the editor — but the wrong content was being rendered on the frontend. Refreshing, clearing cache, and re-saving the pages had no effect.
+
+
+
+Main Cause:
+A slug conflict between a WordPress Page and a custom post type archive was causing WordPress's rewrite rule resolution to route requests incorrectly.
+The site had:
+
+A WordPress Page with slug properties (ID: 47) — intended to be a landing page with Elementor content
+A custom post type property registered with has_archive => 'properties' — which also claimed the properties/ URL
+
+WordPress resolves rewrite rule conflicts based on rule registration order. The CPT archive rule was registered before the page slug rule, so properties/ was being routed to the CPT archive instead of the Page. Meanwhile, the Page with slug news conflicted with the blog's /?category_name=news rewrite, routing blog requests to the page instead.
+
+
+// The conflict — two things claiming the same URL slug:
+// 1. WordPress Page with slug 'properties' (set in admin)
+// 2. CPT archive slug 'properties' (set in register_post_type)
+// WordPress can only route one of them — whichever rule wins in the rewrite table
+
+
+
+
+What We Did:
+
+Step 1 — Mapped the full slug conflict using the rewrite rule debugger:
+
+// functions.php — Temporary rewrite rule debugger
+add_action('parse_request', function($wp) {
+    if (!isset($_GET['debug_route']) || !current_user_can('manage_options')) return;
+
+    echo '<pre style="background:#fff;padding:20px;z-index:9999;position:relative;">';
+    echo "Matched rewrite rules for: " . $_SERVER['REQUEST_URI'] . "\n\n";
+    echo "Query vars resolved:\n";
+    print_r($wp->query_vars);
+    echo "\nMatched rule:\n";
+    print_r($wp->matched_rule ?? 'none');
+    echo "\nMatched query:\n";
+    print_r($wp->matched_query ?? 'none');
+    echo '</pre>';
+    exit;
+});
+// Visit: https://clientsite.com/properties/?debug_route=1
+// Visit: https://clientsite.com/news/?debug_route=1
+
+
+
+
+Step 2 — Resolved the properties/ conflict by choosing one canonical owner for each slug:
+
+// Strategy: Use a DIFFERENT archive slug for the CPT
+// Let the WordPress Page own 'properties' (it has Elementor content)
+// Give the CPT archive a different slug 'property-listings'
+
+// functions.php — Updated post type registration to avoid slug conflict
+add_action('init', function() {
+    register_post_type('property', [
+        'label'       => 'Properties',
+        'public'      => true,
+        'has_archive' => 'property-listings', // Changed from 'properties' — no conflict now
+        'rewrite'     => [
+            'slug'       => 'property',
+            'with_front' => false,
+        ],
+        'supports'    => ['title', 'editor', 'thumbnail', 'excerpt'],
+        // ...rest of args
+    ]);
+}, 0); // Priority 0 — register before most other hooks
+
+
+
+
+
+Step 3 — Fixed the news/ conflict between the blog category and the page:
+
+// The 'news' page slug conflicts with the 'news' category archive
+// Solution: rename the page slug to 'news-blog' and redirect the old URL
+
+// Rename the conflicting page slug via WP-CLI
+// wp post update 48 --post_name=news-blog (ID 48 = the 'news' page)
+
+// Add a 301 redirect for anyone who bookmarked /news/
+add_action('template_redirect', function() {
+    if (is_page('news')) {
+        wp_redirect(home_url('/news-blog/'), 301);
+        exit;
+    }
+});
+
+// OR — keep the page at /news/ but change the CATEGORY slug instead
+// Go to Posts → Categories → News → Edit → change slug from 'news' to 'news-articles'
+// Then add redirect:
+add_action('template_redirect', function() {
+    if (is_category('news')) {
+        wp_redirect(home_url('/category/news-articles/'), 301);
+        exit;
+    }
+});
+
+
+
+
+
+
+Step 4 — Added a slug conflict detector that checks for collisions at init time:
+
+
+// functions.php — Detect slug conflicts between pages, CPTs, and taxonomies
+add_action('wp_loaded', function() {
+    if (!current_user_can('manage_options') || !WP_DEBUG) return;
+
+    global $wp_post_types, $wp_taxonomies;
+
+    // Collect all claimed URL slugs
+    $claimed_slugs = [];
+
+    // WordPress Pages slugs
+    $pages = get_posts(['post_type' => 'page', 'posts_per_page' => -1, 'fields' => 'ids']);
+    foreach ($pages as $page_id) {
+        $slug = get_post_field('post_name', $page_id);
+        if (!empty($slug)) {
+            $claimed_slugs[$slug][] = "Page ID $page_id";
+        }
+    }
+
+    // Custom post type archive slugs
+    foreach ($wp_post_types as $type => $obj) {
+        if ($type === 'post' || $type === 'page' || !$obj->has_archive) continue;
+        $archive_slug = is_string($obj->has_archive) ? $obj->has_archive : $type . 's';
+        $claimed_slugs[$archive_slug][] = "CPT archive: $type";
+
+        // Also check the single post type slug
+        if (!empty($obj->rewrite['slug'])) {
+            $claimed_slugs[$obj->rewrite['slug']][] = "CPT single: $type";
+        }
+    }
+
+    // Taxonomy slugs
+    foreach ($wp_taxonomies as $tax => $obj) {
+        if (empty($obj->rewrite['slug'])) continue;
+        $claimed_slugs[$obj->rewrite['slug']][] = "Taxonomy: $tax";
+    }
+
+    // Find and log conflicts
+    foreach ($claimed_slugs as $slug => $claimants) {
+        if (count($claimants) > 1) {
+            error_log(sprintf(
+                'Slug conflict detected: /%s/ is claimed by: %s',
+                $slug,
+                implode(' AND ', $claimants)
+            ));
+        }
+    }
+});
+
+
+
+
+
+Step 5 — Flushed rewrite rules and verified routing:
+
+# Flush after all slug changes
+wp rewrite flush --hard
+
+# Verify each URL routes to the correct content
+wp eval '
+$urls = ["/properties/", "/property-listings/", "/news/", "/news-blog/"];
+foreach ($urls as $url) {
+    $result = url_to_postid(home_url($url));
+    echo str_pad($url, 30) . " → post ID: $result\n";
+}
+'
+
+
+
+Both pages rendered their correct content immediately after the slug rename and rewrite flush. A site-wide audit found two additional slug conflicts that were pre-emptively resolved. 
+
+
+
+
+
+
+
+

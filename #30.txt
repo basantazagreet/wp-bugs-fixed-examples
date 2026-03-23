@@ -1,0 +1,54 @@
+Bug Title / Short Description (one liner) :  "My child theme stopped inheriting styles from the parent theme"
+Bug category: Themes & Template Rendering
+
+Description: 
+A client running a WooCommerce store had a child theme set up, but after a parent theme update, all the child theme's styling broke — buttons lost color, fonts reverted, and the layout shifted noticeably.
+
+
+Main Cause:
+The parent theme update changed its stylesheet handle name from parent-style to storefront-style. The child theme's wp_enqueue_scripts was still referencing the old handle as a dependency, so the parent CSS was loading after the child CSS instead of before it.
+
+
+What we Did:
+Inspected the parent theme's functions.php to find the correct new handle:
+
+
+// What the parent theme now registered:
+
+wp_enqueue_style('storefront-style', get_template_directory_uri() . '/style.css');
+
+Then updated the child theme's enqueue function to match:
+
+
+// child theme functions.php — BEFORE (broken)
+add_action('wp_enqueue_scripts', function() {
+    wp_enqueue_style(
+        'child-style',
+        get_stylesheet_uri(),
+        ['parent-style'] //  Wrong handle — parent CSS not loading first
+    );
+});
+
+
+
+
+// child theme functions.php — AFTER (fixed)
+add_action('wp_enqueue_scripts', function() {
+    wp_enqueue_style(
+        'storefront-style',                          // re-enqueue parent explicitly
+        get_template_directory_uri() . '/style.css'
+    );
+    wp_enqueue_style(
+        'child-style',
+        get_stylesheet_uri(),
+        ['storefront-style']                         //  Correct dependency
+    );
+});
+
+
+All styles cascaded correctly again and the WooCommerce layout was fully restored. 
+
+
+
+
+

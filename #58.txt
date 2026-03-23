@@ -1,0 +1,130 @@
+Bug Title / Short Description (one liner) :"Every single page load is slow — even pages with no content"
+Bug category: Database & Query Layer
+
+Description:
+A SaaS client running a WordPress-based platform reported consistently slow page loads (4–8 seconds) across the entire site — even simple static pages. Disabling all plugins helped slightly but the baseline was still 3+ seconds. Hosting, CDN, and server specs were all adequate. The issue had crept in gradually over 18 months.
+
+
+Main Cause:
+WordPress loads ALL autoloaded options from wp_options on every single page request — this is by design for performance. However, over 18 months of plugin installs, updates, and removals, the wp_options table had accumulated 47MB of autoloaded data — including stale transients, orphaned plugin data, and several plugins storing large serialized arrays with autoload = yes.
+The single query SELECT option_name, option_value FROM wp_options WHERE autoload = 'yes' was transferring 47MB of data from MySQL to PHP on every page load.
+
+
+
+What We Did:
+
+Step 1 — Measured the autoloaded data size:
+
+sql-- Check total autoloaded data size
+SELECT
+    COUNT(*) AS total_options,
+    SUM(LENGTH(option_value)) AS total_bytes,
+    ROUND(SUM(LENGTH(option_value)) / 1024 / 1024, 2) AS total_mb
+FROM wp_options
+WHERE autoload = 'yes';
+
+-- Result: 2,847 options, 47.3 MB 
+
+
+
+Step 2 — Identified the biggest offenders:
+
+-- Find the largest autoloaded options
+
+SELECT
+    option_name,
+    LENGTH(option_value) AS size_bytes,
+    ROUND(LENGTH(option_value) / 1024, 2) AS size_kb
+FROM wp_options
+WHERE autoload = 'yes'
+ORDER BY size_bytes DESC
+LIMIT 25;
+
+
+-- Top offenders found:
+-- _transient_wc_product_loop         →  4.2 MB (stale WooCommerce transient)
+-- _transient_feed_cache_...          →  2.8 MB (RSS feed cache — should not autoload)
+-- abandoned_plugin_settings_data     →  6.1 MB (orphaned plugin data)
+-- wpseo_indexing_notification_data   →  1.9 MB (Yoast index data — should not autoload)
+
+
+
+
+Step 3 — Cleaned stale transients and orphaned data:
+
+sql-- Delete expired transients (WordPress often doesn't clean these up)
+
+DELETE FROM wp_options
+WHERE option_name LIKE '_transient_%'
+AND option_name NOT LIKE '_transient_timeout_%';
+
+DELETE FROM wp_options
+WHERE option_name LIKE '_transient_timeout_%'
+AND option_value < UNIX_TIMESTAMP();
+
+-- Delete orphaned data from uninstalled plugins (after verifying safe)
+
+DELETE FROM wp_options
+WHERE option_name LIKE 'abandoned_plugin_%';
+
+-- Optimize table after bulk delete
+
+OPTIMIZE TABLE wp_options;
+
+
+
+Step 4 — Set large but necessary options to NOT autoload:
+
+// functions.php — Utility to update autoload status for large options
+function set_option_autoload($option_name, $autoload = 'no') {
+    global $wpdb;
+    $wpdb->query($wpdb->prepare(
+        "UPDATE {$wpdb->options} SET autoload = %s WHERE option_name = %s",
+        $autoload,
+        $option_name
+    ));
+}
+
+// Run once to fix existing large options
+add_action('init', function() {
+    $large_options_no_autoload = [
+        'wpseo_indexing_notification_data',
+        'elementor_css',
+        'wc_shipping_method_order',
+        'tribe_events_calendar_options',
+    ];
+    foreach ($large_options_no_autoload as $option) {
+        set_option_autoload($option, 'no');
+    }
+}, 1);
+
+
+
+Step 5 — Added a monitoring alert to catch autoload bloat in the future:
+
+// functions.php — Alert admin when autoloaded data exceeds 1MB
+add_action('wp_autoload_size_check', function() {
+    global $wpdb;
+    $size_mb = $wpdb->get_var(
+        "SELECT ROUND(SUM(LENGTH(option_value)) / 1024 / 1024, 2)
+         FROM {$wpdb->options} WHERE autoload = 'yes'"
+    );
+    if ($size_mb > 1) {
+        wp_mail(
+            get_option('admin_email'),
+            '⚠️ WordPress Autoload Bloat Detected',
+            "Autoloaded options are now {$size_mb}MB. Please audit wp_options."
+        );
+    }
+});
+if (!wp_next_scheduled('wp_autoload_size_check')) {
+    wp_schedule_event(time(), 'weekly', 'wp_autoload_size_check');
+}
+
+
+
+
+After cleanup, autoloaded data dropped from 47MB to 380KB. Page load times dropped from 4–8 seconds to under 800ms. 
+
+
+

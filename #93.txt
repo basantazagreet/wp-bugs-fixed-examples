@@ -1,0 +1,174 @@
+Bug Title / Short Description (one liner) : "We can't upload PDFs or SVGs — the upload just silently fails or gets rejected"
+Bug category: Media & File Management
+
+Description: 
+A law firm client reported that their staff could not upload PDF case documents or SVG logo files to the Media Library. PDF uploads showed a "Sorry, this file type is not permitted for security reasons" error. SVG uploads uploaded silently but then never appeared in the Media Library — they vanished without a trace.
+
+
+
+Main Cause:
+For PDFs: A security plugin had added an overly broad MIME type restriction that was stripping PDFs from WordPress's allowed upload types list. The filter was meant to block executable file types but accidentally included application/pdf in its blocklist.
+For SVGs: WordPress deliberately excludes SVG uploads by default because SVG files can contain embedded JavaScript — making them a potential XSS vector. The upload was "succeeding" at the file level but WordPress was then silently deleting the file after its MIME type check failed during the metadata-saving step.
+
+
+
+
+What we did:
+
+Step 1 — Diagnosed both issues separately:
+
+// functions.php — Log MIME type check results for all uploads
+add_filter('wp_check_filetype_and_ext', function($data, $file, $filename, $mimes, $real_mime) {
+    error_log(sprintf(
+        'MIME check: file=%s ext=%s type=%s allowed=%s',
+        $filename,
+        $data['ext']  ?? 'none',
+        $data['type'] ?? 'none',
+        $data['ext']  ? 'yes' : 'NO'
+    ));
+    return $data;
+}, 10, 5);
+
+
+// For SVG — check if file exists then gets deleted
+add_action('add_attachment', function($id) {
+    error_log('Attachment added: ID=' . $id . ' file=' . get_attached_file($id));
+});
+add_action('delete_attachment', function($id) {
+    error_log('Attachment DELETED: ID=' . $id);
+});
+
+
+
+
+Step 2 — Re-enabled PDF uploads by correcting the security plugin's MIME blocklist:
+
+// functions.php — Restore PDF as an allowed upload type
+add_filter('upload_mimes', function($mimes) {
+    // Ensure PDF is always allowed — it was blocked by security plugin
+    $mimes['pdf'] = 'application/pdf';
+    return $mimes;
+});
+
+// Verify MIME type detection for PDFs (required on some server configs)
+add_filter('wp_check_filetype_and_ext', function($data, $file, $filename, $mimes) {
+    if (!$data['type']) {
+        $filetype = wp_check_filetype($filename, $mimes);
+        if ($filetype['ext'] === 'pdf') {
+            $data['ext']             = 'pdf';
+            $data['type']            = 'application/pdf';
+            $data['proper_filename'] = $filename;
+        }
+    }
+    return $data;
+}, 10, 4);
+
+
+
+
+
+
+
+Step 3 — Enabled SVG uploads safely with sanitization to remove any embedded scripts:
+
+// functions.php — Allow SVG uploads with mandatory sanitization
+
+// Step 1: Add SVG to allowed MIME types
+add_filter('upload_mimes', function($mimes) {
+    // Only allow SVG for editors and admins — not subscribers or contributors
+    if (current_user_can('edit_posts')) {
+        $mimes['svg']  = 'image/svg+xml';
+        $mimes['svgz'] = 'image/svg+xml';
+    }
+    return $mimes;
+});
+
+
+// Step 2: Fix WordPress MIME detection for SVG files
+add_filter('wp_check_filetype_and_ext', function($data, $file, $filename, $mimes) {
+    $filetype = wp_check_filetype($filename, $mimes);
+    if ($filetype['ext'] === 'svg') {
+        $data['ext']  = 'svg';
+        $data['type'] = 'image/svg+xml';
+    }
+    return $data;
+}, 10, 4);
+
+
+// Step 3: Sanitize SVG content on upload — remove all scripts and event handlers
+add_filter('wp_handle_upload_prefilter', function($file) {
+    if ($file['type'] !== 'image/svg+xml') return $file;
+
+    $svg_content = file_get_contents($file['tmp_name']);
+
+    // Strip <script> tags entirely
+    $svg_content = preg_replace('/<script[\s\S]*?<\/script>/i', '', $svg_content);
+
+    // Strip on* event handler attributes (onclick, onload, onerror, etc.)
+    $svg_content = preg_replace('/\s+on\w+\s*=\s*"[^"]*"/i', '', $svg_content);
+    $svg_content = preg_replace("/\s+on\w+\s*=\s*'[^']*'/i", '', $svg_content);
+
+    // Strip javascript: href/src values
+    $svg_content = preg_replace('/href\s*=\s*["\']?\s*javascript:[^"\'>\s]*/i', 'href="#"', $svg_content);
+
+    // Strip <use> tags that reference external resources (SSRF risk)
+    $svg_content = preg_replace('/<use[^>]+href\s*=\s*["\']https?:\/\/[^"\']*["\'][^>]*>/i', '', $svg_content);
+
+    file_put_contents($file['tmp_name'], $svg_content);
+    return $file;
+});
+
+
+
+// Step 4: Allow SVGs to display correctly in Media Library
+add_filter('wp_prepare_attachment_for_js', function($response, $attachment) {
+    if ($response['mime'] === 'image/svg+xml') {
+        $response['sizes'] = [
+            'full' => [
+                'url'         => $response['url'],
+                'width'       => 0,
+                'height'      => 0,
+                'orientation' => 'landscape',
+            ],
+        ];
+    }
+    return $response;
+}, 10, 2);
+
+
+
+
+
+
+
+Step 4 — Added an allowed file type dashboard widget so admins can see at a glance what is and isn't permitted:
+
+
+// functions.php — Admin widget showing current upload restrictions
+add_action('wp_dashboard_setup', function() {
+    wp_add_dashboard_widget(
+        'upload_types_widget',
+        'Allowed Upload File Types',
+        function() {
+            $mimes = get_allowed_mime_types();
+            $exts  = implode(', ', array_keys($mimes));
+            echo '<p style="font-family:monospace;font-size:12px;word-break:break-all;">';
+            echo esc_html($exts);
+            echo '</p>';
+            echo '<p><small>To add or remove types, contact your developer.</small></p>';
+        }
+    );
+});
+
+
+
+
+
+PDFs were uploading and displaying correctly within 30 minutes. SVGs were uploading safely with all script content stripped on arrival. 
+
+
+
+
+
+
+

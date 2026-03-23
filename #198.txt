@@ -1,0 +1,293 @@
+Bug Title / Short Description (one liner) : "After a WordPress update some posts are duplicated and others have lost their metadata"
+Bug category: Updates & Upgrade System 
+
+Description: 
+A publishing platform client reported that after a WordPress 6.3 → 6.4 core update, approximately 340 posts had duplicate entries in the database and another 180 posts had completely lost their custom field metadata (author bios, article categories, and SEO fields). The content team noticed the problem two days after the update when editorial reports showed impossible post counts. Reverting the update was not possible — content had been published in the intervening two days.
+
+
+
+
+
+Main Cause:
+WordPress core updates include database migration scripts (upgrade.php) that modify table structures and migrate data. The migration script for 6.4 included a routine to consolidate certain post meta entries. A caching layer (Redis) on the site was serving stale data during the update window — so when the migration script queried for posts to migrate, it received cached pre-migration results and processed the same posts twice. The double-processing inserted duplicate rows and — because the migration deleted originals after copying — some records were deleted before their copies were confirmed, leaving posts with no metadata.
+Additionally, the site had a custom plugin that hooked into dbDelta() to add its own table columns — and this hook fired twice during the upgrade because the admin had clicked "Update" in the dashboard while an auto-update was simultaneously in progress via WP-Cron.
+
+
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Assessed the damage with surgical database queries:
+
+
+sql-- Find duplicate posts (same title, same author, same date)
+
+SELECT
+    post_title,
+    post_author,
+    DATE(post_date) AS post_date,
+    COUNT(*) AS duplicates,
+    GROUP_CONCAT(ID ORDER BY ID ASC) AS post_ids
+FROM wp_posts
+WHERE post_type   = 'post'
+AND   post_status = 'publish'
+GROUP BY post_title, post_author, DATE(post_date)
+HAVING duplicates > 1
+ORDER BY duplicates DESC;
+
+
+-- Find posts with missing critical meta fields
+
+SELECT p.ID, p.post_title
+FROM wp_posts p
+LEFT JOIN wp_postmeta pm ON p.ID = pm.post_id AND pm.meta_key = '_author_bio'
+WHERE p.post_type   = 'post'
+AND   p.post_status = 'publish'
+AND   pm.meta_id    IS NULL    -- No author_bio entry at all
+ORDER BY p.post_date DESC;
+
+
+-- Count scope of damage
+SELECT
+    (SELECT COUNT(*) FROM wp_posts
+     WHERE post_type = 'post' AND post_status = 'publish') AS total_posts,
+    (SELECT COUNT(*) FROM (
+        SELECT post_title, post_author, DATE(post_date)
+        FROM wp_posts WHERE post_type = 'post' AND post_status = 'publish'
+        GROUP BY post_title, post_author, DATE(post_date)
+        HAVING COUNT(*) > 1
+    ) d) AS posts_with_duplicates,
+    (SELECT COUNT(*) FROM wp_posts p
+     LEFT JOIN wp_postmeta pm ON p.ID = pm.post_id AND pm.meta_key = '_author_bio'
+     WHERE p.post_type = 'post' AND p.post_status = 'publish'
+     AND pm.meta_id IS NULL) AS posts_missing_meta;
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+     
+Step 2 — Recovered missing metadata from database backup:
+
+
+# Extract wp_postmeta from the pre-update backup
+mysqldump backup_db wp_postmeta > /tmp/postmeta_backup.sql
+
+# Import into a recovery database
+mysql -u root -p recovery_db < /tmp/postmeta_backup.sql
+
+# Find meta records that exist in backup but are missing from production
+
+mysql -u root -p -e "
+
+SELECT bm.post_id, bm.meta_key, bm.meta_value
+FROM recovery_db.wp_postmeta bm
+LEFT JOIN production_db.wp_postmeta pm
+    ON bm.post_id = pm.post_id AND bm.meta_key = pm.meta_key
+WHERE pm.meta_id IS NULL
+AND   bm.meta_key IN ('_author_bio', '_article_category', '_seo_title', '_seo_description')
+INTO OUTFILE '/tmp/recovered_meta.csv'
+FIELDS TERMINATED BY ',' ENCLOSED BY '\"' LINES TERMINATED BY '\n';
+"
+
+
+
+
+
+
+
+
+
+Step 3 — Re-imported the recovered metadata safely:
+
+// restore-missing-meta.php — Run via: wp eval-file restore-missing-meta.php
+global $wpdb;
+
+$csv_file = '/tmp/recovered_meta.csv';
+if (!file_exists($csv_file)) {
+    echo "Recovery file not found. Run the MySQL export first.\n";
+    return;
+}
+
+$rows     = array_map('str_getcsv', file($csv_file));
+$restored = 0;
+$skipped  = 0;
+
+foreach ($rows as $row) {
+    if (count($row) < 3) continue;
+
+    [$post_id, $meta_key, $meta_value] = $row;
+    $post_id  = absint($post_id);
+    $meta_key = sanitize_key($meta_key);
+
+    // Verify the post still exists before restoring
+    if (!get_post($post_id)) {
+        $skipped++;
+        continue;
+    }
+
+    // Only restore if genuinely missing — don't overwrite existing data
+    $existing = get_post_meta($post_id, $meta_key, true);
+    if (!empty($existing)) {
+        $skipped++;
+        continue;
+    }
+
+    update_post_meta($post_id, $meta_key, wp_slash($meta_value));
+    $restored++;
+}
+
+echo "Meta restored: $restored rows\n";
+echo "Skipped (already present or post missing): $skipped rows\n";
+
+
+
+
+
+
+
+
+
+
+
+
+Step 4 — Removed duplicate posts, keeping the oldest (original) version:
+// remove-duplicate-posts.php — Run via: wp eval-file remove-duplicate-posts.php
+global $wpdb;
+
+// Get all groups of duplicates
+$duplicates = $wpdb->get_results("
+    SELECT
+        MIN(ID)          AS keep_id,
+        GROUP_CONCAT(ID ORDER BY ID ASC) AS all_ids
+    FROM wp_posts
+    WHERE post_type   = 'post'
+    AND   post_status = 'publish'
+    GROUP BY post_title, post_author, DATE(post_date)
+    HAVING COUNT(*) > 1
+");
+
+$deleted = 0;
+
+foreach ($duplicates as $group) {
+    $all_ids  = explode(',', $group->all_ids);
+    $keep_id  = (int) $group->keep_id;
+    $del_ids  = array_filter($all_ids, fn($id) => (int)$id !== $keep_id);
+
+    foreach ($del_ids as $del_id) {
+        $del_id = (int) $del_id;
+
+        // Before deleting — make sure the keeper has all meta from the duplicate
+        $dup_meta = get_post_meta($del_id);
+        foreach ($dup_meta as $key => $values) {
+            if (!get_post_meta($keep_id, $key, true)) {
+                update_post_meta($keep_id, $key, $values[0]);
+            }
+        }
+
+        // Hard delete the duplicate
+        wp_delete_post($del_id, true);
+        $deleted++;
+        echo "Deleted duplicate post ID $del_id (kept $keep_id)\n";
+    }
+}
+
+echo "\nTotal duplicates removed: $deleted\n";
+
+
+
+
+
+
+
+
+
+Step 5 — Prevented the double-upgrade scenario with an update lock:
+
+// wp-content/mu-plugins/update-lock.php
+// Prevents simultaneous manual + cron update execution
+
+add_filter('auto_update_core', function($update) {
+    // If an admin-initiated update is already in progress, skip auto-update
+    if (get_transient('manual_update_in_progress')) {
+        error_log('Auto-update skipped — manual update in progress.');
+        return false;
+    }
+    return $update;
+});
+
+// Set the lock when an admin manually initiates an update
+add_action('upgrader_process_complete', function() {
+    delete_transient('manual_update_in_progress');
+}, 10, 0);
+
+// Hook into the update initiation to set the lock
+add_action('admin_init', function() {
+    if (isset($_GET['action']) && $_GET['action'] === 'do-core-upgrade') {
+        set_transient('manual_update_in_progress', true, 10 * MINUTE_IN_SECONDS);
+    }
+});
+
+
+
+
+
+Step 6 — Added a pre-update cache flush to prevent stale cache poisoning migration scripts:
+
+// functions.php — Flush all caches before any update begins
+
+add_filter('upgrader_pre_install', function($response) {
+
+    // Flush WordPress object cache
+    wp_cache_flush();
+
+    // Flush Redis if available
+    if (class_exists('Redis')) {
+        try {
+            $redis = new Redis();
+            $redis->connect('127.0.0.1', 6379);
+            $redis->flushDB();
+        } catch (Exception $e) {
+            error_log('Redis flush failed during pre-update: ' . $e->getMessage());
+        }
+    }
+
+    // Flush OPcache so PHP loads fresh files after update
+    if (function_exists('opcache_reset')) {
+        opcache_reset();
+    }
+
+    error_log('Pre-update cache flush complete at ' . current_time('mysql'));
+    return $response;
+}, 1); // Priority 1 — runs before anything else
+
+
+
+
+
+
+
+
+
+340 duplicate posts were removed cleanly. 180 posts had their metadata fully restored from backup. Total data recovery: 98.4% — the remaining 1.6% were posts created in the gap between the backup and the update. 
+
+
+
+
+
+
+
+
+
+
+
+

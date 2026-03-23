@@ -1,0 +1,53 @@
+Bug Title / Short Description (one liner) :  "My custom page template isn't being picked up by WordPress"
+Bug category: Themes & Template Rendering
+
+Description: A client hired us after spending days confused about why their custom page template they built wasn't appearing in the WordPress page editor dropdown — the "Template" selector in the sidebar simply didn't show it.
+
+
+Main Cause:
+The template file had a typo in the template header comment — the Template Name: declaration was missing the colon, which WordPress uses to detect and register custom templates.
+
+
+What We Did:
+Found the broken template header:
+
+
+//  Broken — WordPress ignores this file as a template
+<?php
+/*
+ * Template Name  Full Width Landing Page
+ * Template Post Type: page
+ */
+ 
+ 
+Fixed the header with proper syntax:
+ //Fixed — WordPress now detects and registers the template
+<?php
+/*
+ * Template Name: Full Width Landing Page
+ * Template Post Type: page
+ */
+ 
+ 
+ 
+But the template still wasn't showing up — because WordPress caches the template list. Cleared it with WP-CLI:
+
+
+wp cache flush
+wp rewrite flush
+
+For sites without WP-CLI access, I also added a quick programmatic cache flush as a safety net:
+
+// functions.php — force template cache refresh on theme switch or upgrade
+add_action('after_switch_theme', function() {
+    delete_transient('template_files_cache');
+    wp_cache_flush();
+});
+
+
+The template appeared in the dropdown immediately after. 
+
+
+
+
+

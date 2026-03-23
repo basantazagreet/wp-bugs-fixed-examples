@@ -1,0 +1,216 @@
+Bug Title / Short Description (one liner) : "WordPress crashes on every page with a fatal error mentioning unserialize()"
+Bug category: Core Settings & Options API
+
+Description:
+A client's WordPress site was throwing a fatal PHP error on every single page — both frontend and backend — making it completely inaccessible. The error message in the server log read:
+
+PHP Fatal error: Uncaught Error: Class 'Mega_Menu_Walker' not found
+in /var/www/html/wp-includes/class-wp-hook.php on line 308
+
+This error was being triggered during WordPress's init hook because a serialized option in wp_options referenced a class (Mega_Menu_Walker) from a plugin that had been deactivated. WordPress was trying to unserialize the option, failing to find the class, and crashing — on every request.
+
+
+
+
+
+
+
+Main Cause :
+
+The Mega Menu plugin had stored its configuration as a serialized PHP object (not a plain array) using update_option(). When the plugin was deactivated, its class definitions were no longer available. On every page load, WordPress's get_option() call for the menu config attempted to unserialize the stored value — and PHP's unserialize() requires all referenced classes to be available at deserialization time. The missing class caused an __PHP_Incomplete_Class error that escalated to a fatal.
+
+// What was stored in wp_options (simplified):
+// option_name: mega_menu_settings
+// option_value: O:16:"Mega_Menu_Walker":3:{s:5:"items";a:0:{}...}
+//               ^ This is a serialized PHP OBJECT — dangerous to store in options
+
+// On every get_option('mega_menu_settings') call:
+// PHP tries to unserialize → Mega_Menu_Walker class not found → Fatal Error
+
+
+
+
+
+
+
+
+What We Did:
+
+
+
+Step 1 — Accessed the site via WP-CLI (which bypasses the HTTP fatal error):
+
+
+# WP-CLI works even when the site is fatally broken via HTTP
+# Because it runs PHP directly, not through the web server
+
+# Confirm the problematic option
+wp option get mega_menu_settings
+# Output: PHP Notice: Serialized data contained an invalid class...
+
+# Check which options contain Mega_Menu references
+wp eval '
+global $wpdb;
+$results = $wpdb->get_results(
+    "SELECT option_name FROM {$wpdb->options}
+     WHERE option_value LIKE \"%Mega_Menu%\""
+);
+foreach ($results as $r) echo $r->option_name . "\n";
+'
+
+
+
+
+
+
+
+Step 2 — Neutralized the corrupted option by replacing the serialized object with a safe empty array:
+
+# Replace the corrupted serialized object with a clean empty array
+# This immediately stops the fatal error on every page load
+wp option update mega_menu_settings '[]'
+
+
+# Verify the site is accessible again
+wp eval 'echo "WordPress is now accessible.\n";'
+curl -I https://clientsite.com
+# HTTP/2 200 ← Site is back
+
+
+
+
+
+
+
+
+Step 3 — Wrote a safe unserialize wrapper to handle future class-not-found scenarios gracefully:
+
+// functions.php — Safe unserialize that handles missing classes without fatal errors
+function safe_unserialize($data, $allowed_classes = false) {
+    if (!is_string($data)) return $data;
+
+    // Check if data is actually serialized before attempting
+    if (!is_serialized($data)) return $data;
+
+    // PHP 7.0+ supports allowed_classes parameter to prevent object injection
+    // Setting to false prevents instantiation of any class — returns __PHP_Incomplete_Class
+    // instead of fataling when class is missing
+    if (PHP_VERSION_ID >= 70000) {
+        $result = unserialize($data, ['allowed_classes' => $allowed_classes]);
+    } else {
+        // For older PHP — wrap in try/catch
+        try {
+            $result = @unserialize($data);
+        } catch (Throwable $e) {
+            error_log('Unserialize failed: ' . $e->getMessage() . ' | Data: ' . substr($data, 0, 100));
+            return false;
+        }
+    }
+
+    // If we got an incomplete class, log it and return false
+    if ($result instanceof __PHP_Incomplete_Class) {
+        $class_name = array_keys((array)$result)[0] ?? 'unknown';
+        error_log("Incomplete class during unserialize: $class_name — plugin may be deactivated.");
+        return false;
+    }
+
+    return $result;
+}
+
+
+
+// Patch WordPress's get_option to use safe unserialize for known problematic options
+
+add_filter('option_mega_menu_settings', function($value) {
+    if (is_string($value) && is_serialized($value)) {
+        $unserialized = safe_unserialize($value, false); // Disallow objects
+        return $unserialized !== false ? $unserialized : [];
+    }
+    return $value;
+});
+
+
+
+
+
+
+
+
+
+
+
+
+Step 4 — Audited all options storing serialized objects and converted them to arrays:
+
+// audit-serialized-objects.php — Find options storing PHP objects (not just arrays)
+// Run via: wp eval-file audit-serialized-objects.php
+
+global $wpdb;
+
+$options = $wpdb->get_results(
+    "SELECT option_name, option_value FROM {$wpdb->options}
+     WHERE option_value LIKE 'O:%:%:{%'"  // PHP serialized object pattern
+);
+
+echo count($options) . " options contain serialized PHP objects:\n\n";
+
+foreach ($options as $option) {
+    // Try to identify the class name from the serialized string
+    preg_match('/^O:\d+:"([^"]+)"/', $option->option_value, $matches);
+    $class_name = $matches[1] ?? 'unknown';
+    $class_exists = class_exists($class_name);
+
+    printf(
+        "Option: %-50s | Class: %-40s | Class exists: %s\n",
+        $option->option_name,
+        $class_name,
+        $class_exists ? 'YES' : 'NO — RISK OF FATAL ERROR'
+    );
+}
+
+
+
+
+
+
+
+
+Step 5 — Added a plugin deactivation cleanup hook so future plugin removals clean up their options:
+
+// functions.php — Force plugins to declare and clean up their options on deactivation
+// This is added to the client's must-use plugins directory
+
+add_action('deactivated_plugin', function($plugin_file) {
+    // Log all options that may be orphaned when this plugin deactivates
+    $plugin_slug = dirname($plugin_file);
+
+    global $wpdb;
+    $potentially_orphaned = $wpdb->get_results($wpdb->prepare("
+        SELECT option_name, LENGTH(option_value) AS size
+        FROM {$wpdb->options}
+        WHERE option_name LIKE %s
+        OR    option_name LIKE %s
+    ",
+        '%' . $wpdb->esc_like($plugin_slug) . '%',
+        '%' . $wpdb->esc_like(str_replace('-', '_', $plugin_slug)) . '%'
+    ));
+
+    if (!empty($potentially_orphaned)) {
+        error_log(sprintf(
+            'Plugin "%s" deactivated. %d potentially orphaned options found. ' .
+            'Consider running cleanup if not reactivating.',
+            $plugin_slug,
+            count($potentially_orphaned)
+        ));
+    }
+});
+
+
+
+
+
+
+The fatal error was resolved in under 5 minutes using WP-CLI. The root cause audit found 4 other options storing serialized objects from deactivated plugins — all were converted to safe arrays. 
+
+
+

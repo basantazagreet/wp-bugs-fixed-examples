@@ -1,0 +1,147 @@
+Bug Title / Short Description (one liner) :  "Our iOS and Android app stopped publishing posts — broken for two weeks"
+Bug category: REST API & XML-RPC
+
+
+Description:
+A media company had a native mobile app (iOS + Android) that allowed field journalists to publish articles directly from their phones using the WordPress XML-RPC API (xmlrpc.php). After a site migration and server change, the app stopped working entirely — publishing returned a generic connection error and the app developers were blaming the WordPress setup.
+
+
+
+Main Cause:
+During the server migration, the new Nginx configuration was missing the XML-RPC passthrough rule. A security hardening template had been applied that included a rule blocking all requests to xmlrpc.php with a 403 Forbidden. Since the app's error handling only showed a generic "connection failed" message, neither the client nor the app team realised the block was at the server level — not in WordPress.
+WordPress also had XML-RPC disabled via a plugin filter as a secondary "security measure," which would have blocked it even if the Nginx rule were fixed.
+
+
+
+
+What we did:
+
+
+Step 1 — Tested XML-RPC directly to confirm the server-level block:
+
+# Test XML-RPC availability
+curl -X POST https://client-site.com/xmlrpc.php \
+     -H "Content-Type: text/xml" \
+     -d '<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>'
+
+# Response: 403 Forbidden — confirmed server-level block, not WordPress
+
+
+
+
+
+Step 2 — Fixed the Nginx configuration to allow XML-RPC for authorised IP ranges only:
+
+
+# /etc/nginx/sites-available/client-site.conf
+
+location = /xmlrpc.php {
+    # Restrict to mobile app backend server IPs only
+    allow 203.0.113.0/24;   # Mobile app backend IP range
+    allow 198.51.100.50;    # Secondary app server
+    deny  all;              # Block all other sources
+
+    fastcgi_pass unix:/run/php/php8.1-fpm.sock;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    include fastcgi_params;
+}
+
+
+
+
+Step 3 — Re-enabled XML-RPC in WordPress with a strict method allowlist:
+
+// functions.php — Remove blanket disable and restrict to needed methods only
+remove_filter('xmlrpc_enabled', '__return_false');
+
+add_filter('xmlrpc_methods', function($methods) {
+    // Only expose the methods the mobile app actually uses
+    $allowed_methods = [
+        'wp.newPost',
+        'wp.editPost',
+        'wp.getPost',
+        'wp.getPosts',
+        'wp.uploadFile',
+        'wp.getMediaItem',
+        'wp.getTaxonomies',
+        'wp.getTerms',
+        'system.listMethods', // Required for app handshake
+    ];
+
+    return array_intersect_key(
+        $methods,
+        array_flip($allowed_methods)
+    );
+});
+
+
+
+
+
+Step 4 — Added XML-RPC request logging to help the app team debug future issues:
+
+// functions.php — Log all XML-RPC calls with user and method info
+add_action('xmlrpc_call', function($method) {
+    $user = wp_get_current_user();
+    error_log(sprintf(
+        'XML-RPC call: method=%s user=%s ip=%s time=%s',
+        $method,
+        $user->user_login ?? 'unauthenticated',
+        $_SERVER['REMOTE_ADDR'],
+        current_time('mysql')
+    ));
+});
+
+
+
+
+
+Step 5 — Provided a REST API migration map to modernise the app away from XML-RPC long term:
+
+// XML-RPC → REST API migration reference for the mobile app team
+
+
+
+// OLD: wp.newPost via XML-RPC
+xmlrpc.call('wp.newPost', [blogId, username, password, content]);
+
+// NEW: REST API equivalent with JWT auth
+const response = await fetch('/wp-json/wp/v2/posts', {
+    method: 'POST',
+    headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${jwtToken}`,
+    },
+    body: JSON.stringify({
+        title:   postData.title,
+        content: postData.content,
+        status:  'publish',
+    }),
+});
+
+
+
+
+// OLD: wp.uploadFile via XML-RPC
+xmlrpc.call('wp.uploadFile', [blogId, username, password, fileData]);
+
+
+// NEW: REST API media upload
+const formData = new FormData();
+formData.append('file', fileBlob, 'photo.jpg');
+const mediaResponse = await fetch('/wp-json/wp/v2/media', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${jwtToken}` },
+    body: formData,
+});
+
+
+The mobile app was publishing again within 3 hours. The REST API migration was scheduled as a follow-up project. 
+
+
+
+
+
+
+
+

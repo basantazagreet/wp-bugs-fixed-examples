@@ -1,0 +1,48 @@
+Bug Title / Short Description (one liner) : "Checkout is completely broken after we installed a translation plugin"
+Bug category: Plugin Compatibility & Integration
+
+
+Description: 
+A WooCommerce store owner installed WPML (WordPress Multilingual Plugin) to support English and French customers. Immediately after activation, the checkout page broke — customers couldn't proceed past the billing details step. The "Place Order" button would spin indefinitely and no orders were being created.
+
+
+Main Cause:
+WPML was intercepting and duplicating WooCommerce's AJAX endpoint URLs, appending a language slug (/fr/) to the WooCommerce checkout AJAX action URL. The WooCommerce AJAX handler woocommerce_checkout was registered under the English URL only, so all translated AJAX calls returned a 0 response — WooCommerce's default for unregistered AJAX actions.
+
+
+ What we Did:
+First, confirmed the issue by monitoring AJAX requests in the browser DevTools Network tab, which revealed:
+POST /fr/?wc-ajax=checkout  →  Response: 0
+POST /?wc-ajax=checkout     →  Response: {"result":"success",...}
+
+
+Then added a filter to prevent WPML from translating WooCommerce's AJAX URLs:
+
+
+// functions.php — Prevent WPML from translating WooCommerce AJAX URLs
+add_filter('wcml_endpoints_url_fix', '__return_true');
+
+
+// Also explicitly whitelist WooCommerce AJAX endpoints from WPML URL rewriting
+add_filter('wpml_is_translated_url', function($translated, $url) {
+    $wc_ajax_actions = [
+        'woocommerce_checkout',
+        'woocommerce_get_refreshed_fragments',
+        'woocommerce_apply_coupon',
+        'woocommerce_update_order_review',
+    ];
+    foreach ($wc_ajax_actions as $action) {
+        if (strpos($url, 'wc-ajax=' . $action) !== false) {
+            return false; // Don't translate WC AJAX URLs
+        }
+    }
+    return $translated;
+}, 10, 2);
+
+
+Additionally, configured WPML's WooCommerce Multilingual companion plugin settings to sync product translations and exclude checkout endpoints from URL translation.
+
+Result: Checkout worked in both English and French immediately. 
+
+
+

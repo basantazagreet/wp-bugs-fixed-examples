@@ -1,0 +1,245 @@
+Bug Title / Short Description (one liner) : "We paid for translations of our plugin but half the strings are not being translated"
+Bug category: Internationalization & Localization (i18n/l10n)
+
+
+Description: 
+A plugin development client had hired a professional translator to provide French and Spanish translations for their custom booking plugin. The translator delivered fully populated .po and .mo files covering 100% of the strings. After installation, only about 40% of the plugin's visible strings were actually appearing in French or Spanish — the remaining 60% stubbornly appeared in English regardless of the locale setting.
+
+
+
+
+Main Cause:
+The untranslated strings were all coming from code that bypassed WordPress's i18n functions entirely. The plugin had been built by a contractor who used three different anti-patterns that prevented strings from being translatable:
+
+Direct string output — echo "Book Now"; instead of echo __('Book Now', 'booking-plugin');
+PHP string interpolation inside i18n functions — __("Welcome $name", 'booking-plugin') — which is untranslatable because translation lookup requires a static string
+JavaScript strings hardcoded in .js files with no wp_localize_script() bridge
+
+
+
+
+
+
+What We Did:
+
+Step 1 — Scanned the codebase for all non-translatable strings:
+
+
+
+bash# Find all echo/print statements that output hardcoded English strings
+# without using __(), _e(), esc_html__(), etc.
+
+grep -rn --include="*.php" \
+    -e 'echo\s*"[A-Z][^"]*"' \
+    -e "echo\s*'[A-Z][^']*'" \
+    -e 'printf\s*(\s*"[A-Z]' \
+    /var/www/html/wp-content/plugins/booking-plugin/ \
+    | grep -v '__(' \
+    | grep -v '_e(' \
+    | grep -v 'esc_html' \
+    | head -30
+
+# Also check for interpolated strings inside i18n calls (untranslatable)
+grep -rn --include="*.php" \
+    -e '__\s*(\s*"[^"]*\$[^"]*"' \
+    -e "__\s*(\s*'[^']*\$[^']*'" \
+    /var/www/html/wp-content/plugins/booking-plugin/
+    
+    
+    
+    
+    
+    
+    
+Step 2 — Fixed all non-translatable PHP strings:
+
+// booking-plugin/includes/booking-form.php — Before and after examples
+
+// ─── Pattern 1: Direct echo without i18n ───
+
+// BEFORE — Not translatable:
+echo "Book Now";
+echo "Select a date";
+echo "Available slots";
+
+// AFTER — Translatable with text domain:
+echo esc_html__('Book Now',        'booking-plugin');
+echo esc_html__('Select a date',   'booking-plugin');
+echo esc_html__('Available slots', 'booking-plugin');
+
+// ─── Pattern 2: String interpolation in i18n function ───
+
+// BEFORE — Interpolation makes the string untranslatable
+// (The translator sees the static string, runtime inserts $name breaking lookup)
+echo __("Welcome $user_name, your booking is confirmed.", 'booking-plugin');
+
+// AFTER — Use sprintf() with placeholder — translator sees the full string with %s
+echo sprintf(
+    /* translators: %s = the customer's first name */
+    esc_html__('Welcome %s, your booking is confirmed.', 'booking-plugin'),
+    esc_html($user_name)
+);
+
+// ─── Pattern 3: Plural forms ───
+
+// BEFORE — No plural handling:
+echo $count . " slots available";
+
+// AFTER — Correct plural with _n():
+echo sprintf(
+    /* translators: %d = number of available time slots */
+    esc_html(_n('%d slot available', '%d slots available', $count, 'booking-plugin')),
+    $count
+);
+
+// ─── Pattern 4: HTML context — use esc_html__ or wp_kses_post ───
+
+// BEFORE:
+echo '<p class="notice">Your booking has been confirmed.</p>';
+
+// AFTER — translatable, properly escaped:
+echo '<p class="notice">' .
+     esc_html__('Your booking has been confirmed.', 'booking-plugin') .
+     '</p>';
+     
+     
+     
+     
+     
+     
+     
+Step 3 — Fixed JavaScript strings using wp_localize_script():
+
+php// booking-plugin/booking-plugin.php — Pass translatable strings to JavaScript
+
+add_action('wp_enqueue_scripts', function() {
+    wp_enqueue_script(
+        'booking-plugin-js',
+        plugins_url('assets/js/booking.js', __FILE__),
+        ['jquery'],
+        BOOKING_PLUGIN_VERSION,
+        true
+    );
+
+    // Pass ALL user-visible strings to JavaScript via wp_localize_script()
+    // This is the ONLY way to make JS strings translatable in WordPress
+    wp_localize_script('booking-plugin-js', 'bookingI18n', [
+        'bookNow'            => esc_html__('Book Now',                  'booking-plugin'),
+        'selectDate'         => esc_html__('Select a date',             'booking-plugin'),
+        'noSlotsAvailable'   => esc_html__('No slots available',        'booking-plugin'),
+        'confirmBooking'     => esc_html__('Confirm your booking?',     'booking-plugin'),
+        'bookingConfirmed'   => esc_html__('Booking confirmed!',        'booking-plugin'),
+        'bookingFailed'      => esc_html__('Booking failed. Please try again.', 'booking-plugin'),
+        'loading'            => esc_html__('Loading available times...','booking-plugin'),
+        'timeSlot'           => esc_html__('Time slot',                 'booking-plugin'),
+        /* translators: %s = formatted date string */
+        'selectedDate'       => esc_html__('Selected: %s',              'booking-plugin'),
+        'cancel'             => esc_html__('Cancel',                    'booking-plugin'),
+        'close'              => esc_html__('Close',                     'booking-plugin'),
+        // Date/time format strings — also translatable for locale-specific formats
+        'dateFormat'         => esc_html__('MMMM D, YYYY',              'booking-plugin'),
+        'timeFormat'         => esc_html__('h:mm A',                    'booking-plugin'),
+    ]);
+});
+javascript// assets/js/booking.js — Use localised strings instead of hardcoded English
+
+
+
+// BEFORE — Hardcoded English strings in JS (untranslatable):
+button.textContent = 'Book Now';
+alert('Booking confirmed!');
+document.querySelector('.status').textContent = 'Loading available times...';
+
+
+
+// AFTER — Use the localised strings object passed from PHP:
+button.textContent = bookingI18n.bookNow;
+
+// For strings with placeholders:
+const dateText = bookingI18n.selectedDate.replace('%s', formattedDate);
+document.querySelector('.selected-date').textContent = dateText;
+
+// In AJAX callbacks:
+fetch(ajaxUrl, { method: 'POST', body: formData })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) {
+            showNotice(bookingI18n.bookingConfirmed, 'success');
+        } else {
+            showNotice(bookingI18n.bookingFailed, 'error');
+        }
+    });
+    
+    
+    
+    
+    
+    
+    
+    
+Step 4 — Regenerated the .pot file with the fixed strings for the translators:
+
+bash# Generate a fresh .pot file from the corrected codebase
+# This is the master template translators use to create .po files
+
+wp i18n make-pot \
+    /var/www/html/wp-content/plugins/booking-plugin/ \
+    /var/www/html/wp-content/plugins/booking-plugin/languages/booking-plugin.pot \
+    --domain=booking-plugin \
+    --exclude=vendor,node_modules,tests \
+    --headers='{"Report-Msgid-Bugs-To":"support@bookingplugin.com","Last-Translator":"FULL NAME <EMAIL@ADDRESS>","Language-Team":"LANGUAGE <LL@li.org>"}'
+
+# Count total translatable strings in the new .pot
+grep -c '^msgid' /var/www/html/wp-content/plugins/booking-plugin/languages/booking-plugin.pot
+# Before fix: 47 strings
+# After fix:  189 strings ← All previously hardcoded strings now extractable
+
+
+
+
+
+
+
+
+
+Step 5 — Compiled the updated translations from the .po to .mo binary format:
+
+bash# Compile .po to .mo for each language
+# (Translators updated the .po file based on the new .pot — we just compile)
+
+wp i18n make-mo \
+    /var/www/html/wp-content/plugins/booking-plugin/languages/
+
+# Verify the compiled .mo files
+for mo_file in /var/www/html/wp-content/plugins/booking-plugin/languages/*.mo; do
+    entry_count=$(wp eval "
+        \$mo = new MO();
+        \$mo->import_from_file('$mo_file');
+        echo count(\$mo->entries);
+    ")
+    echo "$mo_file: $entry_count translations"
+done
+
+# Output:
+# booking-plugin-fr_FR.mo: 189 translations ✅
+# booking-plugin-es_ES.mo: 189 translations ✅
+
+
+
+
+
+
+
+
+
+Translation coverage went from 40% to 100% across both French and Spanish. The translator was provided the updated .pot file and confirmed the new 189-string set matched the visible UI completely. 
+
+
+
+
+
+
+
+
+
+

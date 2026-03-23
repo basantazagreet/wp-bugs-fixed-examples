@@ -1,0 +1,56 @@
+Bug Title / Short Description (one liner) :  "Our WooCommerce product pages are blank — only when using Elementor templates"
+Bug category: Plugin Compatibility & Integration
+
+Description: 
+A fashion retailer using Elementor Pro's WooCommerce Builder to design custom product page templates reported that all product pages showed a completely blank content area. Standard WooCommerce product pages worked fine, but any page using an Elementor Pro template was empty below the header.
+
+
+Main Cause:
+After a combined update of Elementor Pro (3.18) and WooCommerce (8.2), a breaking change in WooCommerce's HPOS (High-Performance Order Storage) feature conflicted with how Elementor's Product_Post_Type class was checking for post type compatibility. Elementor was receiving a null return from a WooCommerce function that previously returned a post object, causing the template renderer to exit early and output nothing.
+
+
+
+What we Did:
+Step 1 — Isolated the conflict by temporarily switching one product page to a default WooCommerce template, confirming it rendered fine. Enabled WP_DEBUG which exposed:
+
+PHP Warning: Attempt to read property "post_type" on null
+in /plugins/elementor-pro/modules/woocommerce/classes/product-post-type.php on line 89
+
+
+Step 2 — Added a null check guard while the plugin developers pushed a patch:
+
+// functions.php — Guard against Elementor/WooCommerce null product object
+add_filter('elementor/woocommerce/product_post_type_data', function($data, $post_id) {
+    if (empty($post_id)) return $data;
+
+    $product = wc_get_product($post_id);
+    if (!$product instanceof WC_Product) {
+        // Return safe defaults instead of null
+        return array_merge($data, [
+            'post_type' => 'product',
+            'is_valid'  => false,
+        ]);
+    }
+    return $data;
+}, 10, 2);
+
+
+
+Step 3 — Disabled HPOS temporarily while the patch was confirmed stable:
+
+// Disable HPOS via filter to restore legacy order storage compatibility
+add_filter('woocommerce_feature_hpos_enabled', '__return_false');
+
+
+Step 4 — Re-enabled HPOS once Elementor Pro released the compatibility patch (3.18.2), and removed the workaround filters.
+
+
+Also recommended the client implement a staging site with automatic plugin update testing — and set up WP Sandbox to mirror production before any future combined updates. 
+
+
+
+
+
+
+
+

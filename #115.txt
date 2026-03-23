@@ -1,0 +1,140 @@
+Bug Title / Short Description (one liner) : "Half the admin functions are broken — everything says 'Are you sure you want to do this?'"
+Bug category: Security & Permissions
+
+Description: 
+A large multi-author publishing site with three load-balanced servers reported that legitimate admin actions were constantly failing with WordPress's nonce verification page: "Are you sure you want to do this? Please try again." Affected actions included bulk post operations, plugin activations, user role changes, and workflow approvals. Editors were spending more time retrying failed actions than actually working.
+
+
+
+Main Cause:
+Three interacting issues caused widespread nonce failures across the load-balanced environment:
+
+No shared object cache — WordPress nonces are derived from user session data and server secrets stored in the object cache. With requests hitting different nodes (Node A generated the nonce, Node B verified it), the cache states were inconsistent, making valid nonces appear invalid.
+
+Full-page cache serving stale admin pages — the caching plugin was incorrectly caching some admin pages, serving a nonce generated for one user to a different user's session.
+Server clock skew — one node's clock was 8 minutes ahead. Since WordPress nonce validity windows are computed from time(), a nonce from the fast-clock server fell in a different validity tick on other nodes.
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Diagnosed nonce failures with targeted logging:
+
+// mu-plugins/nonce-debug.php — Log every nonce failure with server context
+
+add_filter('wp_verify_nonce_failed', function($nonce, $action) {
+    error_log(sprintf(
+        '[NONCE FAIL] action=%s nonce_prefix=%s user=%d server=%s time=%d',
+        $action,
+        substr($nonce, 0, 8) . '...',
+        get_current_user_id(),
+        gethostname(),  // Which node handled this request
+        time()
+    ));
+    return false;
+}, 10, 2);
+
+Log confirmed the same nonce was failing when Node B verified what Node A had generated.
+
+
+
+
+
+Step 2 — Deployed Redis as a shared object cache across all nodes:
+
+
+// wp-config.php — Shared Redis object cache for all load balancer nodes
+define('WP_REDIS_HOST',         '10.0.1.50'); // Internal Redis server
+define('WP_REDIS_PORT',         6379);
+define('WP_REDIS_PASSWORD',     'strong-redis-password');
+define('WP_REDIS_DATABASE',     0);
+define('WP_REDIS_TIMEOUT',      1);
+define('WP_REDIS_READ_TIMEOUT', 1);
+define('WP_CACHE',              true);
+
+# Install and enable Redis Object Cache
+wp plugin install redis-cache --activate
+wp redis enable
+wp redis status   # Verify connection to shared Redis server
+
+
+
+
+
+
+
+Step 3 — Synchronized all server clocks with NTP:
+
+# Install NTP on all nodes
+sudo apt-get install -y ntp
+sudo systemctl enable ntp && sudo systemctl start ntp
+
+
+# Verify synchronization
+timedatectl status | grep "synchronized"
+# Expected: System clock synchronized: yes
+
+
+# Verify all nodes agree within 1 second
+for node in 10.0.1.10 10.0.1.11 10.0.1.12; do
+    echo "$node: $(ssh $node 'date +%s')"
+done
+
+
+
+
+
+
+Step 4 — Fixed the caching plugin to never cache admin pages or logged-in user pages:
+
+// functions.php — Exclude admin and authenticated pages from cache
+add_filter('rocket_exclude_pages', function($excluded) {
+    return array_merge($excluded, ['/wp-admin/', '/wp-login.php']);
+});
+
+
+add_filter('do_rocket_generate_caching_files', function($do_cache) {
+    if (is_admin() || is_user_logged_in()) {
+        return false; // Never cache for logged-in users — nonces are session-specific
+    }
+    return $do_cache;
+});
+
+
+
+
+
+
+Step 5 — Added a nonce health check widget to the admin dashboard:
+
+// functions.php — Dashboard widget alerting on nonce system failures
+
+add_action('wp_dashboard_setup', function() {
+
+    wp_add_dashboard_widget('nonce_health', 'System Health', function() {
+        $test_nonce = wp_create_nonce('health_check_test');
+        $verified   = wp_verify_nonce($test_nonce, 'health_check_test');
+
+        if ($verified) {
+            echo '<p style="color:green;">✅ Nonce system is working correctly.</p>';
+            echo '<p>Object cache: <strong>' . (wp_using_ext_object_cache() ? 'Redis (shared)' : 'Local (per-node)') . '</strong></p>';
+        } else {
+            echo '<p style="color:red;">⚠️ Nonce verification is FAILING. Check object cache and server clock sync.</p>';
+        }
+    });
+    
+});
+
+
+
+
+
+Nonce failures dropped from dozens per hour to zero within 20 minutes of Redis being deployed across all nodes. The editorial team's workflow was fully restored. 
+
+
+
+
+

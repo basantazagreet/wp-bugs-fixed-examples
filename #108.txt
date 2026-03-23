@@ -1,0 +1,194 @@
+Bug Title / Short Description (one liner) :  "Our plugin settings keep getting reset to defaults — nobody on the team is doing it"
+Bug category: Security & Permissions
+
+
+Description:
+A marketing agency client reported that their SEO plugin settings, redirect rules, and custom options were being mysteriously reset multiple times per week — at odd hours outside of business time. No team member admitted to the changes. A user had also posted in a blog comment saying they "found an interesting bug."
+
+
+
+Main Cause:
+A Cross-Site Request Forgery (CSRF) vulnerability in the custom settings page handler. The settings form had no nonce field and no nonce verification — meaning any POST or GET request from any origin would be processed as long as the user was logged in. The attacker had crafted a disguised link that, when clicked by any logged-in user (even a subscriber), silently submitted the settings form. The link was embedded as a 1×1 pixel image in blog comments.
+
+
+
+The malicious markup being shared in blog comments:
+
+html<!-- Hidden as a 1x1 "tracking pixel" in blog post comments -->
+<img src="https://client-site.com/wp-admin/admin-post.php?action=save_seo_settings&seo_active=0&api_key=attacker_key" width="1" height="1">
+
+
+The vulnerable handler — no nonce, no origin check:
+
+// The unprotected settings handler:
+add_action('admin_post_save_seo_settings', function() {
+    // No nonce check — processes ANY authenticated request from ANY origin
+    update_option('custom_seo_settings', [
+        'seo_active' => intval($_REQUEST['seo_active']),
+        'api_key'    => sanitize_text_field($_REQUEST['api_key']),
+    ]);
+    wp_redirect(admin_url('options-general.php?page=custom-seo&saved=1'));
+    exit;
+});
+
+
+
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Fixed the settings form with a proper nonce field:
+
+// Settings page render function — generate nonce tied to action + user + session
+function render_seo_settings_page() { ?>
+    <div class="wrap">
+        <h1>SEO Settings</h1>
+        <form method="POST" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+
+            <!-- CSRF protection: cryptographic token tied to user + session + action -->
+            <?php wp_nonce_field('save_seo_settings_action', 'seo_settings_nonce'); ?>
+            <input type="hidden" name="action" value="save_seo_settings">
+
+            <table class="form-table">
+                <tr>
+                    <th>SEO Active</th>
+                    <td>
+                        <input type="checkbox" name="seo_active" value="1"
+                            <?php checked(1, get_option('custom_seo_settings')['seo_active'] ?? 0); ?>>
+                    </td>
+                </tr>
+                <tr>
+                    <th>API Key</th>
+                    <td>
+                        <input type="text" name="api_key" class="regular-text"
+                            value="<?php echo esc_attr(get_option('custom_seo_settings')['api_key'] ?? ''); ?>">
+                    </td>
+                </tr>
+            </table>
+
+            <?php submit_button('Save Settings'); ?>
+        </form>
+    </div>
+<?php }
+
+
+
+
+
+
+
+
+
+Step 2 — Fixed the handler with nonce verification and capability check:
+
+// Settings handler — verify nonce BEFORE touching any data
+add_action('admin_post_save_seo_settings', function() {
+
+    // 1. Verify nonce — rejects requests that didn't originate from our form
+    if (!isset($_POST['seo_settings_nonce']) ||
+        !wp_verify_nonce($_POST['seo_settings_nonce'], 'save_seo_settings_action')) {
+        wp_die(
+            'Security check failed. Please go back and try again.',
+            'CSRF Protection',
+            ['response' => 403, 'back_link' => true]
+        );
+    }
+
+    // 2. Verify user has the required capability
+    if (!current_user_can('manage_options')) {
+        wp_die('Insufficient permissions.', 'Access Denied', ['response' => 403]);
+    }
+
+    // 3. Only then process — use $_POST only, never $_REQUEST (which includes GET)
+    update_option('custom_seo_settings', [
+        'seo_active' => isset($_POST['seo_active']) ? 1 : 0,
+        'api_key'    => sanitize_text_field($_POST['api_key'] ?? ''),
+    ]);
+
+    wp_safe_redirect(add_query_arg(
+        ['page' => 'custom-seo', 'saved' => '1'],
+        admin_url('options-general.php')
+    ));
+    exit;
+});
+
+
+
+
+
+
+Step 3 — Secured all AJAX handlers in the plugin with the same pattern:
+
+// Secure AJAX handler template — apply to EVERY wp_ajax_ handler without exception
+add_action('wp_ajax_custom_seo_action', function() {
+
+    // These three lines are mandatory on every single AJAX handler
+    check_ajax_referer('custom_seo_ajax_nonce', 'nonce');
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(['message' => 'Unauthorized'], 403);
+    }
+
+    // Process safely using only POST data
+    $data = sanitize_text_field($_POST['data'] ?? '');
+    wp_send_json_success(['result' => $data]);
+});
+
+// Pass nonce to JavaScript — generated fresh on every page load
+wp_localize_script('custom-seo-js', 'customSeoAjax', [
+    'ajax_url' => admin_url('admin-ajax.php'),
+    'nonce'    => wp_create_nonce('custom_seo_ajax_nonce'),
+]);
+
+
+
+
+
+Step 4 — Added a settings change audit log for future traceability:
+
+// functions.php — Log all changes to critical options with user and IP
+add_action('updated_option', function($option_name, $old_value, $new_value) {
+    $monitored = [
+        'custom_seo_settings', 'blogname', 'admin_email', 'siteurl', 'home',
+    ];
+    
+    if (!in_array($option_name, $monitored, true)) return;
+
+    $user = wp_get_current_user();
+    error_log(sprintf(
+        '[SETTINGS CHANGE] option=%s user=%s(%d) ip=%s time=%s',
+        $option_name,
+        $user->user_login,
+        $user->ID,
+        $_SERVER['REMOTE_ADDR'] ?? 'cli',
+        current_time('mysql')
+    ));
+}, 10, 3);
+
+
+
+
+
+
+Settings were stable immediately after the nonce fix. The audit log traced 14 previous unauthorized resets back to a single IP address, which was permanently banned. 
+
+
+
+
+
+
+
+
+
+Bug Title / Short Description (one liner) : 
+Bug category: Security & Permissions
+Description: 
+
+
+Main Cause:
+
+
+What we Did:

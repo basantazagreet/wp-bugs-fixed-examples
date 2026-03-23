@@ -1,0 +1,277 @@
+Bug Title / Short Description (one liner) : "When users switch languages mid-session WooCommerce prices and dates show wrong formats"
+Bug category: Internationalization & Localization (i18n/l10n)
+
+
+Description:
+A European e-commerce client running a WooCommerce store in three locales — English (en_GB), German (de_DE), and Polish (pl_PL) — reported that when users switched languages using the language switcher, several critical display elements broke:
+
+Prices showed the wrong currency symbol position (e.g., €50.00 instead of 50,00 € for German/Polish)
+Decimal separators flipped incorrectly (period vs comma) mid-session
+Dates on order confirmations showed US-format (M/D/Y) regardless of language
+WooCommerce "Add to Cart" buttons reverted to English after switching to German or Polish
+
+The bugs only appeared when switching languages — if a user loaded the page fresh in German, everything was correct.
+
+
+
+
+
+Main Cause:
+The language switcher was changing the URL locale prefix correctly, but four locale-sensitive systems were cached with the first session's locale and not reinitialising on language switch:
+
+WooCommerce price format (woocommerce_price_format, woocommerce_price_decimal_sep, woocommerce_price_thousand_sep) was cached in a PHP static variable and only resolved once per request — subsequent AJAX language switches didn't re-resolve it.
+WordPress's setlocale() call for LC_TIME (date formatting) was only called during initial bootstrap, not when WPML switched locale mid-session.
+Translated WooCommerce button strings were loaded via load_plugin_textdomain() once at init — WPML's language switch fired after this, so the buttons stayed in the boot locale.
+JavaScript Intl locale for client-side price and date formatting was set once during page load and never updated on AJAX navigation.
+
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Diagnosed locale caching by logging locale state at multiple points:
+
+php// functions.php — Trace locale through a language switch sequence
+add_action('wpml_language_has_switched', function($language_code, $cookie_lang) {
+    error_log(sprintf(
+        'Language switched to: %s | get_locale(): %s | setlocale(LC_TIME): %s',
+        $language_code,
+        get_locale(),
+        setlocale(LC_TIME, 0) // 0 = query current, don't change
+    ));
+}, 10, 2);
+
+
+
+
+
+
+
+Step 2 — Forced WooCommerce price format to reinitialise on language switch:
+
+
+php// functions.php — Reset WooCommerce locale-sensitive formatting on language switch
+add_action('wpml_language_has_switched', function($language_code) {
+
+    // Force WooCommerce to reload its locale settings
+    // WooCommerce caches these in static class variables — we must reset them
+    if (class_exists('WC_Countries')) {
+        // Clear the static cache in WC_Countries
+        $wc_countries = new WC_Countries();
+        // Re-trigger locale loading
+        do_action('woocommerce_init'); // Re-fires locale-sensitive WC hooks
+    }
+
+    // Reload locale-specific number formatting
+    switch ($language_code) {
+        case 'de':
+            add_filter('woocommerce_price_decimal_sep',   fn() => ',');
+            add_filter('woocommerce_price_thousand_sep',  fn() => '.');
+            add_filter('woocommerce_price_format',        fn() => '%2$s&nbsp;%1$s'); // € after
+            break;
+        case 'pl':
+            add_filter('woocommerce_price_decimal_sep',   fn() => ',');
+            add_filter('woocommerce_price_thousand_sep',  fn() => '&nbsp;');
+            add_filter('woocommerce_price_format',        fn() => '%2$s&nbsp;%1$s'); // zł after
+            break;
+        case 'en':
+        default:
+            add_filter('woocommerce_price_decimal_sep',   fn() => '.');
+            add_filter('woocommerce_price_thousand_sep',  fn() => ',');
+            add_filter('woocommerce_price_format',        fn() => '%1$s%2$s'); // £ before
+            break;
+    }
+
+    // Clear WooCommerce transient caches that may hold old formatted prices
+    wc_delete_shop_order_transients();
+    WC_Cache_Helper::get_transient_version('product', true);
+
+}, 10, 1);
+
+
+
+
+
+
+
+Step 3 — Fixed setlocale() for date formatting to re-apply on locale switch:
+
+php// functions.php — Re-apply PHP locale on WPML language switch
+add_action('wpml_language_has_switched', function($language_code) {
+
+    // Map WPML language codes to PHP locale identifiers
+    $locale_map = [
+        'en' => ['en_GB.UTF-8', 'en_GB', 'en'],
+        'de' => ['de_DE.UTF-8', 'de_DE', 'de'],
+        'pl' => ['pl_PL.UTF-8', 'pl_PL', 'pl'],
+    ];
+
+    $locales = $locale_map[$language_code] ?? ['en_GB.UTF-8'];
+
+    // Apply to all locale categories
+    setlocale(LC_TIME,      $locales);
+    setlocale(LC_MONETARY,  $locales);
+    setlocale(LC_NUMERIC,   $locales);
+
+    // Also update WordPress's internal locale state
+    // This ensures date_i18n() formats dates correctly for the switched locale
+    global $locale;
+    $locale = get_locale();
+
+    error_log("Locale re-applied for language '$language_code': " . setlocale(LC_TIME, 0));
+}, 20, 1); // Priority 20 — after WPML has set the new locale
+
+
+
+
+
+
+
+
+
+
+
+
+
+Step 4 — Reloaded WooCommerce text domains on language switch:
+
+php// functions.php — Reload plugin translations on mid-session language switch
+add_action('wpml_language_has_switched', function($language_code) {
+
+    // Convert WPML language code to WordPress locale format
+    $locale_map = ['en' => 'en_GB', 'de' => 'de_DE', 'pl' => 'pl_PL'];
+    $new_locale = $locale_map[$language_code] ?? 'en_GB';
+
+    // Unload and reload WooCommerce translations for the new locale
+    global $l10n;
+
+    // Remove cached translations for affected text domains
+    $domains_to_reload = ['woocommerce', 'woocommerce-gateway-stripe', 'client-theme'];
+    foreach ($domains_to_reload as $domain) {
+        unset($l10n[$domain]);
+    }
+
+    // Reload with new locale
+    $wc_mo_file = WP_LANG_DIR . "/plugins/woocommerce-{$new_locale}.mo";
+    if (file_exists($wc_mo_file)) {
+        load_textdomain('woocommerce', $wc_mo_file);
+    }
+
+    // Force theme text domain reload
+    unload_textdomain(get_template());
+    load_theme_textdomain(get_template());
+
+}, 25, 1);
+
+
+
+
+
+
+
+
+
+
+
+Step 5 — Fixed JavaScript Intl locale to update on AJAX language switches:
+
+
+javascript// assets/js/locale-switch.js — Update JS locale on WPML language switch
+
+// Listen for WPML language switch events (fired via custom JS hook)
+document.addEventListener('wpml:languageSwitched', function(e) {
+    const newLocale = e.detail.locale; // e.g. 'de-DE', 'pl-PL', 'en-GB'
+
+    // Update price formatter
+    window.priceFormatter = new Intl.NumberFormat(newLocale, {
+        style:    'currency',
+        currency: e.detail.currency || 'EUR',
+        minimumFractionDigits: 2,
+    });
+
+    // Update date formatter
+    window.dateFormatter = new Intl.DateTimeFormat(newLocale, {
+        year:  'numeric',
+        month: 'long',
+        day:   'numeric',
+    });
+
+    // Re-render all price and date elements on the page
+    document.querySelectorAll('[data-price]').forEach(el => {
+        const rawPrice = parseFloat(el.dataset.price);
+        el.textContent = window.priceFormatter.format(rawPrice);
+    });
+
+    document.querySelectorAll('[data-timestamp]').forEach(el => {
+        const timestamp = parseInt(el.dataset.timestamp) * 1000;
+        el.textContent = window.dateFormatter.format(new Date(timestamp));
+    });
+});
+
+// Trigger the event on WPML language switcher click
+document.querySelectorAll('.wpml-ls-item a').forEach(link => {
+    link.addEventListener('click', function() {
+        const targetLocale = this.dataset.locale ||
+            this.hreflang?.replace('-', '_') ||
+            'en-GB';
+        document.dispatchEvent(new CustomEvent('wpml:languageSwitched', {
+            detail: {
+                locale:   targetLocale,
+                currency: window.wcCurrency || 'EUR',
+            }
+        }));
+    });
+});
+
+
+
+
+
+
+
+Step 6 — Added a locale consistency validator that checks all formatting systems stay in sync:
+
+
+
+php// functions.php — Validate locale consistency across all formatting systems
+add_action('wp_ajax_check_locale_consistency', function() {
+    if (!current_user_can('manage_options')) wp_send_json_error('Forbidden', 403);
+
+    $wp_locale     = get_locale();
+    $php_lc_time   = setlocale(LC_TIME, 0);
+    $php_lc_num    = setlocale(LC_NUMERIC, 0);
+    $wc_decimal    = get_option('woocommerce_price_decimal_sep', '.');
+    $wc_thousand   = get_option('woocommerce_price_thousand_sep', ',');
+    $wc_format     = get_option('woocommerce_price_format', '%1$s%2$s');
+
+    wp_send_json_success([
+        'wp_locale'         => $wp_locale,
+        'php_lc_time'       => $php_lc_time,
+        'php_lc_numeric'    => $php_lc_num,
+        'wc_decimal_sep'    => $wc_decimal,
+        'wc_thousand_sep'   => $wc_thousand,
+        'wc_price_format'   => $wc_format,
+        'date_i18n_sample'  => date_i18n('j F Y'),
+        'price_sample'      => wc_price(1234.56),
+    ]);
+});
+
+
+
+
+
+
+
+
+
+
+
+All three locale formats — English, German, and Polish — rendered prices, dates, and button labels correctly both on fresh page loads and after mid-session language switches. The fix also improved performance slightly by preventing unnecessary re-bootstrap of WooCommerce formatting on every AJAX request. 
+
+
+
+
+

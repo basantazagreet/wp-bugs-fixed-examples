@@ -1,0 +1,145 @@
+Bug Title / Short Description (one liner) :  "The Classic Editor toolbar has disappeared — our editors can't format anything"
+Bug category: Post, Page & Content Editor
+
+
+Description: 
+A law firm client using the Classic Editor plugin reported that after a plugin bundle update, the TinyMCE toolbar was completely gone. The text area was present and editable, but all formatting buttons (bold, italic, headings, lists, links) had disappeared. Their non-technical legal editors were unable to format any documents and were in a panic.
+
+
+
+Main Cause:
+A newly installed legal document formatting plugin had hooked into mce_buttons and mce_buttons_2 to add custom toolbar buttons. However, it contained a bug where the filter callback was returning null instead of the modified array in a conditional branch. TinyMCE received null for the toolbar configuration and silently rendered no toolbar at all.
+
+
+// The broken code in the legal plugin:
+add_filter('mce_buttons', function($buttons) {
+    if (get_option('legal_plugin_active')) {
+        $buttons[] = 'legal_clause_button';
+        return $buttons;
+    }
+    // Missing return in the else branch — returns null implicitly
+});
+
+
+
+
+
+
+ What We Did:
+
+
+Step 1 — Isolated the plugin causing the issue via binary deactivation and confirmed it was the legal document plugin.
+
+
+
+Step 2 — Fixed the broken filter with a proper return in all code paths:
+// legal-plugin/plugin.php — Fixed TinyMCE button filter
+
+// BEFORE — Broken (null return in one branch)
+add_filter('mce_buttons', function($buttons) {
+    if (get_option('legal_plugin_active')) {
+        $buttons[] = 'legal_clause_button';
+        return $buttons;
+    }
+    // Missing return here returns null implicitly
+});
+
+
+// AFTER — Fixed (always returns the array)
+add_filter('mce_buttons', function($buttons) {
+    if (get_option('legal_plugin_active')) {
+        $buttons[] = 'legal_clause_button';
+    }
+    return $buttons; // Always returns — even if no modification was made
+});
+
+
+
+
+Step 3 — Rebuilt the full toolbar configuration to match the law firm's formatting needs:
+
+// functions.php — Full Classic Editor toolbar for legal documents
+
+
+// Row 1 — Primary toolbar
+add_filter('mce_buttons', function($buttons) {
+    return [
+        'formatselect',
+        'bold', 'italic', 'underline', 'strikethrough',
+        'separator',
+        'bullist', 'numlist', 'blockquote',
+        'separator',
+        'alignleft', 'aligncenter', 'alignright', 'alignjustify',
+        'separator',
+        'link', 'unlink',
+        'separator',
+        'undo', 'redo', 'fullscreen',
+    ];
+});
+
+
+
+// Row 2 — Secondary toolbar for legal-specific formatting
+add_filter('mce_buttons_2', function($buttons) {
+    return [
+        'styleselect',
+        'forecolor', 'backcolor',
+        'separator',
+        'outdent', 'indent',
+        'separator',
+        'superscript', 'subscript',
+        'separator',
+        'hr', 'removeformat', 'charmap',
+        'separator',
+        'wp_help',
+    ];
+});
+
+// Register custom legal document styles in the format dropdown
+add_filter('tiny_mce_before_init', function($settings) {
+    $style_formats = [
+        ['title' => 'Legal Heading',    'block'  => 'h2',   'classes' => 'legal-heading'],
+        ['title' => 'Sub Clause',       'block'  => 'h3',   'classes' => 'legal-subclause'],
+        ['title' => 'Definition Term',  'inline' => 'span', 'classes' => 'definition-term'],
+        ['title' => 'Important Notice', 'block'  => 'p',    'classes' => 'legal-notice'],
+        ['title' => 'Redacted',         'inline' => 'span', 'classes' => 'redacted'],
+    ];
+    $settings['style_formats'] = json_encode($style_formats);
+    return $settings;
+});
+
+
+
+
+
+Step 4 — Added a health check that alerts when the toolbar configuration returns an invalid value:
+
+
+
+// functions.php — Detect null returns from mce_buttons filters
+add_action('admin_init', function() {
+    if (!is_admin() || !current_user_can('edit_posts')) return;
+
+    $buttons = apply_filters('mce_buttons', ['bold', 'italic']);
+    if (!is_array($buttons) || empty($buttons)) {
+        add_action('admin_notices', function() {
+            echo '<div class="notice notice-error"><p>';
+            echo '<strong>Editor toolbar misconfiguration detected.</strong> ';
+            echo 'A plugin may be corrupting the TinyMCE button filter. ';
+            echo 'Please check active plugins or contact your developer.';
+            echo '</p></div>';
+        });
+    }
+});
+
+
+
+
+
+The toolbar was restored within 30 minutes and the law firm's editors had a cleaner, more powerful toolbar than before. 
+
+
+
+
+
+

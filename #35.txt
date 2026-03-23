@@ -1,0 +1,80 @@
+
+Bug Title / Short Description (one liner) :  "My homepage looks fine but all inner pages are using the wrong layout"
+Bug category: Themes & Template Rendering
+
+Description: A client's homepage rendered perfectly, but every single inner page (About, Contact, Services, etc.) was displaying with the wrong sidebar layout — the sidebar appeared on pages where it should be hidden, and vice versa.
+
+Main Cause:
+The theme was using a flawed template hierarchy fallback. The developer had named their custom single-page template `page-template.php` instead of following WordPress's naming convention. WordPress was falling back to `index.php` for all inner pages instead of picking up the intended template, pulling in the wrong sidebar logic.
+
+
+What we Did:
+Audited the theme's template hierarchy and renamed/restructured the templates to follow WordPress conventions:
+
+// WordPress Template Hierarchy for Pages:
+// 1. page-{slug}.php       → e.g. page-about.php
+// 2. page-{id}.php         → e.g. page-42.php
+// 3. page.php              → default for ALL pages
+// 4. singular.php
+// 5. index.php             → last resort fallback
+
+
+
+Then fixed the sidebar logic inside page.php using conditional checks:
+
+// page.php — dynamic sidebar logic based on page meta setting
+<?php get_header(); ?>
+
+<div class="site-content <?php echo has_post_thumbnail() ? 'has-featured' : ''; ?>">
+    <main id="primary">
+        <?php while (have_posts()) : the_post(); ?>
+            <?php get_template_part('template-parts/content', 'page'); ?>
+        <?php endwhile; ?>
+    </main>
+
+    <?php
+    // Only show sidebar if page meta allows it
+    $sidebar_option = get_post_meta(get_the_ID(), '_page_sidebar', true);
+    if ($sidebar_option !== 'no_sidebar') {
+        get_sidebar();
+    }
+    ?>
+</div>
+
+<?php get_footer(); ?>
+
+
+
+Added a custom meta box so the client could control sidebar visibility per page without touching code:
+
+// functions.php — Sidebar control meta box
+add_action('add_meta_boxes', function() {
+    add_meta_box(
+        'page_sidebar_options',
+        'Sidebar Options',
+        function($post) {
+            $value = get_post_meta($post->ID, '_page_sidebar', true);
+            echo '<select name="page_sidebar">';
+            echo '<option value="show_sidebar"' . selected($value, 'show_sidebar', false) . '>Show Sidebar</option>';
+            echo '<option value="no_sidebar"'  . selected($value, 'no_sidebar', false)   . '>No Sidebar</option>';
+            echo '</select>';
+        },
+        'page', 'side'
+    );
+});
+
+add_action('save_post', function($post_id) {
+    if (isset($_POST['page_sidebar'])) {
+        update_post_meta($post_id, '_page_sidebar', sanitize_text_field($_POST['page_sidebar']));
+    }
+});
+
+
+
+All inner pages rendered their correct layouts immediately. 
+
+
+
+
+
+

@@ -1,0 +1,99 @@
+Bug Title / Short Description (one liner) :  "Site completely broken after moving from old host to new host"
+Bug category: Database & Query Layer
+
+
+Description: 
+A client migrated their WordPress site from a shared host to a managed VPS using a backup plugin. After migration, the site was completely broken — wp-admin redirected to a 404, the frontend showed a "database error," and no pages loaded at all. The backup had restored successfully with no errors reported.
+
+
+Main Cause:
+The original site used a custom database table prefix (wp_realestate_) instead of the default wp_. The migration plugin restored the database correctly, but the new wp-config.php that was set up on the new server used the default $table_prefix = 'wp_'. WordPress was looking for wp_options but all tables were named wp_realestate_options — causing every single database call to fail.
+Additionally, the siteurl and home values stored in the options table still pointed to the old server's domain.
+
+
+
+
+
+What We Did:
+
+Step 1 — Verified the actual table prefix in the database:
+sql-- List all tables to identify the actual prefix in use
+SHOW TABLES;
+
+
+-- Output showed:
+-- wp_realestate_commentmeta
+-- wp_realestate_comments
+-- wp_realestate_options   ← This confirms the actual prefix
+-- wp_realestate_posts
+-- wp_realestate_users
+
+
+
+
+
+Step 2 — Fixed wp-config.php to match the real prefix:
+
+// wp-config.php — BEFORE (broken)
+$table_prefix = 'wp_';
+
+// wp-config.php — AFTER (fixed)
+$table_prefix = 'wp_realestate_';
+
+
+
+
+Step 3 — Updated URLs in the database to point to the new domain:
+
+# WP-CLI search-replace handles serialized data safely (critical for WordPress)
+wp search-replace 'https://old-domain.com' 'https://new-domain.com' --all-tables --precise --report-changed-only
+
+
+
+
+Step 4 — Fixed user meta table prefix references (a commonly missed step):
+
+WordPress stores capability keys with the table prefix baked in
+These must be updated to match the new prefix
+
+
+UPDATE wp_realestate_usermeta
+SET meta_key = REPLACE(meta_key, 'wp_realestate_', 'wp_realestate_')
+WHERE meta_key LIKE 'wp_%capabilities%'
+   OR meta_key LIKE 'wp_%user_level%'
+   OR meta_key LIKE 'wp_%dashboard_quick_press_last_post_id%';
+   
+   
+   
+   
+   
+Step 5 — Created a pre-migration checklist script for future migrations:
+
+// migration-preflight.php — Run before any migration to document current state
+// Execute via: wp eval-file migration-preflight.php
+
+global $wpdb;
+
+echo "=== WordPress Migration Preflight Check ===\n\n";
+echo "Table Prefix: " . $wpdb->prefix . "\n";
+echo "Site URL: " . get_option('siteurl') . "\n";
+echo "Home URL: " . get_option('home') . "\n";
+echo "WP Version: " . get_bloginfo('version') . "\n";
+echo "PHP Version: " . PHP_VERSION . "\n";
+echo "MySQL Version: " . $wpdb->db_version() . "\n\n";
+
+$tables = $wpdb->get_col("SHOW TABLES LIKE '{$wpdb->prefix}%'");
+echo "Tables Found (" . count($tables) . "):\n";
+foreach ($tables as $table) {
+    $count = $wpdb->get_var("SELECT COUNT(*) FROM $table");
+    echo "  - $table ($count rows)\n";
+}
+
+
+
+Site was fully operational on the new server within 45 minutes. 
+
+
+
+
+

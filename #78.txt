@@ -1,0 +1,184 @@
+Bug Title / Short Description (one liner) : "Private posts are showing up in our API — anyone can read premium content"
+Bug category: REST API & XML-RPC
+
+Description: 
+A subscription newsletter platform built on WordPress discovered that their private posts — premium content visible only to paying subscribers — were being fully returned by the REST API to completely unauthenticated users. Anyone who knew the API URL could read all private articles without a login or subscription. They had been leaking premium content for an unknown period.
+
+
+
+
+Main Cause:
+A custom REST API endpoint built by a previous developer was registering a route using WP_Query with post_status => 'any' and had no permission_callback defined on the route registration. Without a permission_callback, WordPress defaults to __return_true — meaning anyone could call it. Combined with post_status => 'any', all posts regardless of visibility were being returned to anyone who asked.
+
+
+// The dangerous endpoint found in a custom plugin:
+add_action('rest_api_init', function() {
+    register_rest_route('newsletter/v1', '/articles', [
+        'methods'  => 'GET',
+        'callback' => 'get_all_newsletter_articles',
+        // No permission_callback — defaults to __return_true (fully public)
+    ]);
+});
+
+function get_all_newsletter_articles($request) {
+    $posts = get_posts([
+        'post_type'   => 'newsletter_post',
+        'post_status' => 'any',   // Returns private, draft, password-protected — everything
+        'numberposts' => 100,
+    ]);
+    return rest_ensure_response($posts);
+}
+
+
+
+
+
+What We Did:
+
+
+
+Step 1 — Confirmed the leak with a simple unauthenticated curl call:
+
+curl -s https://client-site.com/wp-json/newsletter/v1/articles | python3 -m json.tool | head -50
+# Response included full content of private posts — leak confirmed
+
+
+
+
+
+Step 2 — Immediately patched the endpoint with proper permission handling and status filtering:
+
+
+// custom-newsletter-plugin/plugin.php — Secured endpoint
+
+add_action('rest_api_init', function() {
+    register_rest_route('newsletter/v1', '/articles', [
+        'methods'             => 'GET',
+        'callback'            => 'get_newsletter_articles',
+        'permission_callback' => 'newsletter_api_permission_check', // Required
+        'args'                => [
+            'page'     => ['type' => 'integer', 'default' => 1,  'minimum' => 1],
+            'per_page' => ['type' => 'integer', 'default' => 10, 'minimum' => 1, 'maximum' => 50],
+        ],
+    ]);
+});
+
+// Verify subscriber role before returning any content
+function newsletter_api_permission_check($request) {
+    if (!is_user_logged_in()) {
+        return new WP_Error(
+            'rest_forbidden',
+            'You must be logged in to access newsletter content.',
+            ['status' => 401]
+        );
+    }
+
+    $user             = wp_get_current_user();
+    $has_subscription = get_user_meta($user->ID, '_active_subscription', true);
+
+    if (!$has_subscription || $has_subscription === 'expired') {
+        return new WP_Error(
+            'rest_subscription_required',
+            'An active subscription is required to access this content.',
+            ['status' => 403]
+        );
+    }
+
+    return true;
+}
+
+// Secure data retrieval — only published posts, only safe fields
+function get_newsletter_articles($request) {
+    $query = new WP_Query([
+        'post_type'      => 'newsletter_post',
+        'post_status'    => 'publish', // NEVER use 'any' in API callbacks
+        'posts_per_page' => $request->get_param('per_page'),
+        'paged'          => $request->get_param('page'),
+        'orderby'        => 'date',
+        'order'          => 'DESC',
+    ]);
+
+    // Return ONLY intended fields — never expose raw post objects
+    $articles = array_map(function($post) {
+        return [
+            'id'      => $post->ID,
+            'title'   => get_the_title($post),
+            'excerpt' => get_the_excerpt($post),
+            'date'    => get_the_date('c', $post),
+            'url'     => get_permalink($post),
+        ];
+    }, $query->posts);
+
+    return rest_ensure_response([
+        'articles'    => $articles,
+        'total'       => $query->found_posts,
+        'total_pages' => $query->max_num_pages,
+    ]);
+}
+
+
+
+
+
+
+
+Step 3 — Audited ALL registered REST routes for missing or permissive callbacks:
+
+// audit-rest-routes.php — Run via: wp eval-file audit-rest-routes.php
+$server = rest_get_server();
+$routes = $server->get_routes();
+$flagged = [];
+
+foreach ($routes as $route => $handlers) {
+    foreach ($handlers as $handler) {
+        if (!isset($handler['permission_callback'])) {
+            $flagged[] = ['route' => $route, 'issue' => 'NO permission_callback defined'];
+        } elseif (in_array($handler['permission_callback'], ['__return_true', true], true)) {
+            $flagged[] = ['route' => $route, 'issue' => 'permission_callback is __return_true (fully public)'];
+        }
+    }
+}
+
+if (empty($flagged)) {
+    echo "All REST routes have proper permission callbacks.\n";
+} else {
+    echo count($flagged) . " routes flagged:\n\n";
+    foreach ($flagged as $item) {
+        echo "Route: {$item['route']}\nIssue: {$item['issue']}\n\n";
+    }
+}
+
+
+
+
+
+
+
+
+Step 4 — Added a response sanitizer to strip sensitive fields from all API responses:
+
+// functions.php — Strip sensitive fields from REST responses for this post type
+add_filter('rest_prepare_newsletter_post', function($response, $post, $request) {
+    $data = $response->get_data();
+
+    $sensitive_fields = [
+        'guid', 'slug', 'author', 'comment_status',
+        'ping_status', 'template', 'meta',
+    ];
+
+    foreach ($sensitive_fields as $field) {
+        unset($data[$field]);
+    }
+
+    $response->set_data($data);
+    return $response;
+}, 10, 3);
+
+
+
+The endpoint was patched within 20 minutes. A full audit found 3 additional under-protected endpoints, all fixed the same day. 
+
+
+
+
+

@@ -1,0 +1,69 @@
+Bug Title / Short Description (one liner) :  "After switching themes, my menus completely disappeared"
+Bug category: Themes & Template Rendering
+Description: A client switched from an old theme to a new one and their navigation menus vanished entirely — the header and footer nav were both gone, replaced by an unformatted list of all pages.
+
+
+
+Main Cause:
+The old theme had registered its navigation menus under the location names primary and footer-nav. The new theme registered its menu locations under different names — main-menu and footer-menu. WordPress stores menu assignments by location name, so since the names didn't match, no menus were assigned and it fell back to wp_list_pages().
+
+
+What we Did:
+First, confirmed the new theme's registered menu locations:
+
+// Check what locations the new theme registers
+// Temporarily added to functions.php for diagnosis:
+add_action('init', function() {
+    $locations = get_registered_nav_menus();
+    error_log(print_r($locations, true));
+});
+
+
+
+// Log output showed:
+// Array ( [main-menu] => Primary Menu [footer-menu] => Footer Menu )
+
+Then reassigned menus programmatically to the new location names instead of making the client do it manually through the UI:
+
+// functions.php — one-time menu location migration
+add_action('after_switch_theme', function() {
+    $primary_menu = get_term_by('name', 'Main Navigation', 'nav_menu');
+    $footer_menu  = get_term_by('name', 'Footer Links', 'nav_menu');
+
+    if ($primary_menu && $footer_menu) {
+        set_theme_mod('nav_menu_locations', [
+            'main-menu'   => $primary_menu->term_id,
+            'footer-menu' => $footer_menu->term_id,
+        ]);
+    }
+});
+
+
+For future-proofing, also added a menu location alias map so that if the theme ever changes again, the menus remap automatically:
+
+
+// functions.php — register legacy location aliases
+add_filter('nav_menu_locations', function($locations) {
+    $aliases = [
+        'primary'    => 'main-menu',
+        'footer-nav' => 'footer-menu',
+    ];
+    foreach ($aliases as $old => $new) {
+        if (empty($locations[$new]) && !empty($locations[$old])) {
+            $locations[$new] = $locations[$old];
+        }
+    }
+    return $locations;
+});
+
+
+Both menus reappeared instantly after theme activation, with zero manual steps required from the client. 
+
+
+
+
+
+
+
+
+

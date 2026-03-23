@@ -1,0 +1,169 @@
+Bug Title / Short Description (one liner) :  "Our React app stopped working overnight — every API call returns 401 Unauthorized"
+Bug category: REST API & XML-RPC
+
+
+Description:
+A SaaS startup had built a headless WordPress frontend using React that communicated with WordPress via the REST API using JWT authentication. One morning, every single authenticated API call started returning 401 Unauthorized with no changes deployed on their end. The frontend was completely broken for all logged-in users and their entire product was down.
+
+
+
+
+Main Cause:
+A security plugin (iThemes Security) had run its scheduled "Security Check" overnight and automatically enabled the "Disable REST API for non-logged-in users" option. However, the JWT authentication flow works by sending a token in the Authorization header — the request arrives technically unauthenticated until WordPress processes the JWT token and resolves the user. iThemes was blocking the request at the routing layer before the JWT middleware had a chance to authenticate it, so every request was rejected as anonymous.
+
+
+
+
+
+
+What We Did:
+
+
+
+Step 1 — Confirmed the block source by testing the API directly:
+
+# Test with JWT token — should authenticate but was being blocked
+curl -X GET https://client-site.com/wp-json/wp/v2/posts \
+     -H "Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
+
+
+# Response:
+# {"code":"rest_not_logged_in","message":"You are not currently logged in.","data":{"status":401}}
+# Confirmed: block happens BEFORE JWT token is processed
+
+
+
+
+Step 2 — Disabled the blanket iThemes REST block and replaced it with a smarter policy:
+
+
+// functions.php — Override iThemes Security REST API restriction
+add_filter('itsec_disable_rest_api', function($disabled) {
+    return false; // Allow REST traffic through to JWT middleware
+});
+
+
+
+
+Step 3 — Implemented granular REST access control — block sensitive namespaces while allowing JWT-authenticated routes through:
+
+
+// functions.php — Granular REST API access policy
+add_filter('rest_authentication_errors', function($result) {
+
+    // Already authenticated via session cookie or app password — allow
+    if (!empty($result)) {
+        return $result;
+    }
+
+    // Define namespaces that must remain publicly accessible
+    $public_namespaces = [
+        'wp/v2/posts',
+        'wp/v2/pages',
+        'wp/v2/categories',
+        'wp/v2/tags',
+        'jwt-auth/v1',        // JWT token endpoint must always be public
+        'contact-form-7/v1',  // CF7 submission endpoint
+    ];
+
+    $current_route = $GLOBALS['wp']->query_vars['rest_route'] ?? '';
+
+    foreach ($public_namespaces as $namespace) {
+        if (strpos($current_route, '/' . $namespace) === 0) {
+            return $result; // Allow through without auth
+        }
+    }
+
+    // All other routes require authentication
+    if (!is_user_logged_in()) {
+        return new WP_Error(
+            'rest_not_logged_in',
+            'Authentication required for this endpoint.',
+            ['status' => 401]
+        );
+    }
+
+    return $result;
+});
+
+
+
+
+
+Step 4 — Added automatic JWT token refresh to the React frontend to handle future 401s gracefully:
+
+
+// api/client.js — Axios interceptor for automatic token refresh on 401
+import axios from 'axios';
+
+const apiClient = axios.create({
+    baseURL: process.env.REACT_APP_WP_API_URL,
+});
+
+
+// Attach JWT token to every request
+apiClient.interceptors.request.use((config) => {
+    const token = localStorage.getItem('wp_jwt_token');
+    if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+});
+
+// Auto-refresh on 401 and retry the original request
+apiClient.interceptors.response.use(
+    (response) => response,
+    async (error) => {
+        const originalRequest = error.config;
+
+        if (error.response?.status === 401 && !originalRequest._retry) {
+            originalRequest._retry = true;
+
+            try {
+                const refreshResponse = await axios.post(
+                    `${process.env.REACT_APP_WP_API_URL}/jwt-auth/v1/token/refresh`,
+                    {},
+                    { headers: {
+                        Authorization: `Bearer ${localStorage.getItem('wp_jwt_refresh_token')}`
+                    }}
+                );
+                const newToken = refreshResponse.data.token;
+                localStorage.setItem('wp_jwt_token', newToken);
+                originalRequest.headers.Authorization = `Bearer ${newToken}`;
+                return apiClient(originalRequest); // Retry with refreshed token
+            } catch (refreshError) {
+                localStorage.removeItem('wp_jwt_token');
+                window.location.href = '/login'; // Force re-login
+            }
+        }
+        return Promise.reject(error);
+    }
+);
+
+export default apiClient;
+
+
+
+
+
+Step 5 — Locked the iThemes setting to prevent it from being auto-modified again:
+
+
+
+
+// functions.php — Force REST API setting OFF regardless of iThemes UI state
+
+add_filter('itsec_get_settings', function($settings) {
+    $settings['disable_rest_api'] = 0;
+    return $settings;
+});
+
+
+
+
+
+The React app was restored within 90 minutes. API smoke tests were added to a staging pipeline so this class of failure is caught automatically going forward. 
+
+
+
+

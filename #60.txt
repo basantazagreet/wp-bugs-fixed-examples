@@ -1,0 +1,185 @@
+Bug Title / Short Description (one liner) :  "A plugin update wiped out 3 months of customer order notes"
+Bug category: Database & Query Layer
+
+Description: 
+An e-commerce client woke up to find that all WooCommerce order notes added in the past 3 months had been deleted. This included internal staff notes, customer communication history, and shipping update logs — critical data for their customer service team. The deletion coincided with an update to a custom order management plugin built by a previous contractor.
+
+
+
+Main Cause:
+The custom plugin had an "order cleanup" feature that was intended to delete draft orders older than 90 days. The developer used a raw SQL DELETE query with a flawed WHERE clause that accidentally matched the wp_comments table entries used by WooCommerce to store order notes — because WooCommerce stores order notes as comment_type = 'order_note' in wp_comments.
+
+The query had no comment_type filter, so it deleted all comments on order post types within the date range — including real order notes.
+
+
+
+// The catastrophically flawed code found in the plugin:
+global $wpdb;
+$wpdb->query("
+    DELETE FROM {$wpdb->comments}
+    WHERE comment_post_ID IN (
+        SELECT ID FROM {$wpdb->posts}
+        WHERE post_type = 'shop_order'
+        AND post_date < DATE_SUB(NOW(), INTERVAL 90 DAY)
+    )
+    -- MISSING: AND comment_type = 'order_note' for internal notes only
+    -- MISSING: AND comment_author != 'WooCommerce' for system notes
+");
+
+
+
+
+ What We Did:
+
+
+Step 1 — Assessed the damage immediately:
+
+
+sql-- Check how many order notes currently exist
+SELECT COUNT(*) FROM wp_comments WHERE comment_type = 'order_note';
+-- Result: 47 (should be ~2,800 based on order volume)
+
+-- Check binary log to confirm deletion event and timestamp
+SHOW BINARY LOGS;
+-- Confirmed mass DELETE executed at 02:14 AM during plugin update cron
+
+
+
+
+Step 2 — Recovered data from the most recent database backup (fortunately taken 18 hours prior):
+
+# Extract only wp_comments from the backup to avoid overwriting other data
+mysqldump --single-transaction backup_db wp_comments > comments_backup.sql
+
+# Import into a temporary recovery database
+mysql -u root -p recovery_db < comments_backup.sql
+
+# Export only the order notes that are missing from production
+mysql -u root -p recovery_db -e "
+SELECT * FROM wp_comments
+WHERE comment_type = 'order_note'
+AND comment_date > DATE_SUB(NOW(), INTERVAL 95 DAY)
+INTO OUTFILE '/tmp/recovered_order_notes.csv'
+FIELDS TERMINATED BY ','
+ENCLOSED BY '\"'
+LINES TERMINATED BY '\n';"
+Step 3 — Re-imported recovered notes with adjusted comment IDs to avoid conflicts:
+php// recovery-script.php — Run via wp eval-file
+// Safely re-inserts recovered order notes without ID conflicts
+global $wpdb;
+
+$recovered = array_map('str_getcsv', file('/tmp/recovered_order_notes.csv'));
+
+foreach ($recovered as $row) {
+    $order_id = intval($row[1]);
+    // Verify the parent order still exists before reinserting
+    if (!get_post($order_id)) continue;
+
+    $wpdb->insert(
+        $wpdb->comments,
+        [
+            'comment_post_ID'  => $order_id,
+            'comment_author'   => sanitize_text_field($row[3]),
+            'comment_content'  => wp_kses_post($row[6]),
+            'comment_date'     => $row[9],
+            'comment_type'     => 'order_note',
+            'comment_approved' => 1,
+        ],
+        ['%d', '%s', '%s', '%s', '%s', '%d']
+    );
+    // Re-add the WooCommerce metadata for the note
+    $note_id = $wpdb->insert_id;
+    add_comment_meta($note_id, 'is_customer_note', intval($row['is_customer_note']));
+}
+echo "Recovery complete. " . count($recovered) . " notes restored.\n";
+
+
+
+
+
+
+Step 4 — Patched the dangerous plugin code with proper filters and a safety dry-run mode:
+
+
+// custom-order-cleanup.php — Safe replacement for the dangerous cleanup function
+function safe_cleanup_draft_orders($dry_run = true) {
+    global $wpdb;
+
+    // Step 1: Identify only TRUE draft/pending orders (not notes) older than 90 days
+    $draft_order_ids = $wpdb->get_col("
+        SELECT ID FROM {$wpdb->posts}
+        WHERE post_type   = 'shop_order'
+        AND   post_status IN ('wc-pending', 'auto-draft')
+        AND   post_date   < DATE_SUB(NOW(), INTERVAL 90 DAY)
+    ");
+
+    if (empty($draft_order_ids)) {
+        error_log('Order cleanup: No qualifying draft orders found.');
+        return;
+    }
+
+    $ids_placeholder = implode(',', array_map('intval', $draft_order_ids));
+
+    if ($dry_run) {
+        // Safe mode — only log what WOULD be deleted
+        $notes_at_risk = $wpdb->get_var("
+            SELECT COUNT(*) FROM {$wpdb->comments}
+            WHERE comment_post_ID IN ($ids_placeholder)
+            AND comment_type = 'order_note'
+        ");
+        error_log("DRY RUN: Would delete " . count($draft_order_ids) .
+                  " orders and $notes_at_risk associated notes.");
+        return;
+    }
+
+    // Only delete order notes for draft orders — never real order notes
+    $wpdb->query("
+        DELETE FROM {$wpdb->comments}
+        WHERE comment_post_ID IN ($ids_placeholder)
+        AND   comment_type    = 'order_note'
+        AND   comment_author  = 'WooCommerce' -- System-generated notes only
+    ");
+
+    // Finally delete the draft order posts themselves
+    $wpdb->query("
+        DELETE FROM {$wpdb->posts}
+        WHERE ID IN ($ids_placeholder)
+    ");
+
+    error_log('Order cleanup: Deleted ' . count($draft_order_ids) . ' draft orders safely.');
+}
+
+
+// Always run in dry_run mode first — flip to false only after review
+add_action('wp_scheduled_order_cleanup', function() {
+    safe_cleanup_draft_orders(dry_run: false);
+});
+
+
+
+
+
+Step 5 — Set up automated daily database backups going forward, with a pre-update snapshot hook:
+
+// functions.php — Trigger a database backup before any plugin update
+add_filter('upgrader_pre_install', function($response, $hook_extra) {
+    if (isset($hook_extra['plugin'])) {
+        $timestamp = date('Y-m-d_H-i-s');
+        $backup_file = WP_CONTENT_DIR . "/backups/pre-update_{$timestamp}.sql";
+        shell_exec("mysqldump " . DB_NAME . " > " . escapeshellarg($backup_file));
+        error_log("Pre-update backup created: $backup_file");
+    }
+    return $response;
+}, 10, 2);
+
+
+
+
+94% of the deleted order notes were recovered from the backup. The remaining 6% (notes from the last 18 hours before the backup) were partially reconstructed from WooCommerce email logs. The contractor who wrote the original plugin was removed from the project. 
+
+
+
+
+
+
+

@@ -1,0 +1,277 @@
+Bug Title / Short Description (one liner) : "Our server storage is full — wp-content/uploads is 40GB and growing"
+Bug category: Media & File Management
+
+
+
+Description: 
+A high-traffic blogging platform client received a disk-full alert from their host. Investigation revealed wp-content/uploads had grown to 40GB despite the site having only ~3,000 published posts with a reasonable amount of imagery. The hosting team threatened to suspend the account unless storage was reduced within 48 hours.
+
+
+
+Main Cause:
+Three compounding issues were causing runaway storage growth:
+
+Orphaned media files — thousands of image files on disk had no corresponding record in wp_posts (attachment post type). These were left over from deleted posts, failed imports, and theme/plugin switches that generated images but never cleaned them up.
+Excessive image size generation — 14 registered image sizes (from 6 different plugins each adding their own sizes) meant every uploaded image was generating 14 copies. A single 2MB photo was expanding to 28–35MB total on disk.
+Uncompressed original retention — images were being stored at full original resolution indefinitely, even after thumbnails were generated. A plugin that "optimized" images was actually creating an additional uncompressed backup copy before optimization and never deleting it.
+
+
+
+
+What we did:
+
+
+
+Step 1 — Audited the uploads directory vs database:
+
+// audit-orphaned-media.php — Run via: wp eval-file audit-orphaned-media.php
+global $wpdb;
+
+$upload_dir  = wp_upload_dir();
+$base_path   = $upload_dir['basedir'];
+$total_files = 0;
+$orphan_size = 0;
+$orphan_list = [];
+
+// Get all attachment file paths registered in WordPress
+$registered_files = $wpdb->get_col("
+    SELECT meta_value FROM {$wpdb->postmeta}
+    WHERE meta_key = '_wp_attached_file'
+");
+
+// Build a lookup map
+$registered_map = array_flip(array_map(
+    fn($f) => $base_path . '/' . $f,
+    $registered_files
+));
+
+// Walk the uploads directory and find files not in the map
+$iterator = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator($base_path, FilesystemIterator::SKIP_DOTS)
+);
+
+foreach ($iterator as $file) {
+    if (!$file->isFile()) continue;
+
+    // Skip known non-media files
+    $ext = strtolower($file->getExtension());
+    if (in_array($ext, ['php', 'html', 'htm', 'js', 'css'])) continue;
+
+    $total_files++;
+    $filepath = $file->getRealPath();
+
+    // Check if this exact file OR its parent original is registered
+    $is_registered = isset($registered_map[$filepath]);
+
+    // Also check if it's a generated thumbnail (filename contains dimensions like -300x200)
+    $basename_without_size = preg_replace('/-\d+x\d+(\.\w+)$/', '$1', $filepath);
+    $is_thumbnail = isset($registered_map[$basename_without_size]);
+
+    if (!$is_registered && !$is_thumbnail) {
+        $orphan_size += $file->getSize();
+        $orphan_list[] = $filepath;
+    }
+}
+
+$orphan_gb = round($orphan_size / 1024 / 1024 / 1024, 2);
+echo "Total files scanned: {$total_files}\n";
+echo "Orphaned files found: " . count($orphan_list) . "\n";
+echo "Orphaned storage: {$orphan_gb}GB\n\n";
+
+// Save orphan list for review before deletion
+file_put_contents('/tmp/orphaned_media.txt', implode("\n", $orphan_list));
+echo "Orphan list saved to /tmp/orphaned_media.txt\n";
+echo "Review this file carefully before running the deletion script.\n";
+
+
+
+
+
+
+
+
+
+Step 2 — Safely deleted orphaned files after manual review of the list:
+
+// delete-orphaned-media.php — Run ONLY after reviewing orphaned_media.txt
+// Usage: wp eval-file delete-orphaned-media.php
+
+$orphan_file = '/tmp/orphaned_media.txt';
+if (!file_exists($orphan_file)) {
+    echo "Run audit-orphaned-media.php first.\n";
+    return;
+}
+
+$orphans      = array_filter(explode("\n", file_get_contents($orphan_file)));
+$deleted      = 0;
+$failed       = 0;
+$bytes_freed  = 0;
+
+foreach ($orphans as $filepath) {
+    $filepath = trim($filepath);
+    if (!file_exists($filepath)) continue;
+
+    $size = filesize($filepath);
+
+    if (unlink($filepath)) {
+        $deleted++;
+        $bytes_freed += $size;
+    } else {
+        $failed++;
+        error_log("Failed to delete: $filepath");
+    }
+}
+
+$gb_freed = round($bytes_freed / 1024 / 1024 / 1024, 2);
+echo "Deleted: {$deleted} files ({$gb_freed}GB freed)\n";
+echo "Failed:  {$failed} files\n";
+
+
+
+
+
+
+
+
+
+Step 3 — Reduced registered image sizes by auditing which ones were actually used:
+
+// functions.php — Remove unused image sizes added by inactive/removed plugins
+
+// Check what sizes are registered (run this first to see the full list)
+add_action('init', function() {
+    if (current_user_can('manage_options') && isset($_GET['debug_image_sizes'])) {
+        $sizes = wp_get_registered_image_subsizes();
+        error_log('Registered image sizes: ' . print_r(array_keys($sizes), true));
+    }
+});
+
+// Remove sizes that are not used by the current theme or any active plugin
+add_filter('intermediate_image_sizes_advanced', function($sizes) {
+    // Sizes confirmed unused after theme/template audit
+    $remove_sizes = [
+        'woocommerce_gallery_thumbnail', // WooCommerce size — site doesn't use WooCommerce
+        'woocommerce_single',
+        'woocommerce_thumbnail',
+        'twentytwentyone-fullscreen',    // Old default theme sizes
+        'mailpoet_newsletter_max',       // MailPoet — plugin was removed
+        'tevita_blog_medium',            // Old theme — no longer active
+        'wpforms-screenshot',            // WPForms admin size — no frontend use
+    ];
+
+    foreach ($remove_sizes as $size) {
+        unset($sizes[$size]);
+    }
+
+    return $sizes;
+});
+
+
+
+
+
+
+
+Step 4 — Enabled WebP generation to reduce future storage footprint:
+
+// functions.php — Generate WebP versions instead of multiple JPEG sizes
+// Requires WordPress 5.8+ and GD or Imagick with WebP support
+
+add_filter('wp_upload_image_mime_transforms', function($transforms) {
+    // Generate WebP alongside original JPEG/PNG
+    return [
+        'image/jpeg' => ['image/webp'],
+        'image/png'  => ['image/webp'],
+    ];
+});
+
+// Serve WebP to supporting browsers, fallback to original for others
+add_filter('wp_get_attachment_image_src', function($image, $attachment_id, $size) {
+    if (!$image) return $image;
+
+    $webp_url = preg_replace('/\.(jpe?g|png)$/i', '.webp', $image[0]);
+    $webp_path = str_replace(
+        wp_upload_dir()['baseurl'],
+        wp_upload_dir()['basedir'],
+        $webp_url
+    );
+
+    // Only serve WebP if file exists
+    if (file_exists($webp_path)) {
+        $image[0] = $webp_url;
+    }
+
+    return $image;
+}, 10, 3);
+
+
+
+
+
+
+
+
+Step 5 — Scheduled recurring orphan cleanup to prevent future accumulation:
+
+// functions.php — Monthly orphaned media cleanup
+add_action('monthly_media_cleanup', function() {
+    global $wpdb;
+
+    $upload_dir     = wp_upload_dir();
+    $base_path      = $upload_dir['basedir'];
+    $cutoff_date    = date('Y-m-d', strtotime('-90 days')); // Only files older than 90 days
+    $bytes_freed    = 0;
+    $files_deleted  = 0;
+
+    $registered_files = $wpdb->get_col("
+        SELECT meta_value FROM {$wpdb->postmeta}
+        WHERE meta_key = '_wp_attached_file'
+    ");
+    $registered_map = array_flip(array_map(
+        fn($f) => $base_path . '/' . $f,
+        $registered_files
+    ));
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($base_path, FilesystemIterator::SKIP_DOTS)
+    );
+
+    foreach ($iterator as $file) {
+        if (!$file->isFile()) continue;
+        if (date('Y-m-d', $file->getMTime()) > $cutoff_date) continue; // Skip recent files
+
+        $filepath              = $file->getRealPath();
+        $basename_without_size = preg_replace('/-\d+x\d+(\.\w+)$/', '$1', $filepath);
+
+        if (!isset($registered_map[$filepath]) && !isset($registered_map[$basename_without_size])) {
+            $bytes_freed += $file->getSize();
+            unlink($filepath);
+            $files_deleted++;
+        }
+    }
+
+    $mb_freed = round($bytes_freed / 1024 / 1024, 2);
+    if ($files_deleted > 0) {
+        error_log("Monthly media cleanup: deleted {$files_deleted} files, freed {$mb_freed}MB");
+        wp_mail(
+            get_option('admin_email'),
+            "Monthly Media Cleanup Complete — {$mb_freed}MB Freed",
+            "Deleted {$files_deleted} orphaned media files.\nStorage freed: {$mb_freed}MB"
+        );
+    }
+});
+
+if (!wp_next_scheduled('monthly_media_cleanup')) {
+    wp_schedule_event(time(), 'monthly', 'monthly_media_cleanup');
+}
+
+
+
+
+
+
+Storage dropped from 40GB to 6.2GB — a reduction of 84%. The hosting suspension was avoided. New uploads now generate WebP by default, reducing per-image storage by an additional 40–60% compared to JPEG. 
+
+
+
+

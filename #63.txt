@@ -1,0 +1,135 @@
+Bug Title / Short Description (one liner) :  "The Gutenberg editor is just a white blank box — we can't edit anything"
+Bug category: Post, Page & Content Editor
+
+
+Description:
+A digital agency client reported that after a routine WordPress core update to 6.4, every post and page in the backend showed a completely blank Gutenberg editor. The block editor container loaded but rendered nothing — no blocks, no toolbar, no sidebar panels. The Classic Editor fallback also appeared broken. Publishing was completely halted for their content team.
+
+
+
+Main Cause:
+A JavaScript fatal error in one of their custom Gutenberg block plugins was throwing an uncaught exception during the editor's React initialization phase. Because Gutenberg is a React application, a single unhandled JS error during the component tree mount causes the entire editor to fail to render — similar to a React error boundary not being set. The core update had changed how block attributes were validated, which exposed a latent bug in the custom block's attribute schema.
+
+
+
+
+ What we Did:
+
+
+
+Step 1 — Opened the browser console and immediately found:
+
+Uncaught TypeError: Cannot read properties of undefined (reading 'className')
+    at CustomHeroBlock (custom-blocks.js:247)
+    at renderWithHooks (react-dom.development.js:14985)
+    at mountIndeterminateComponent (react-dom.development.js:17811)
+    
+    
+    
+    
+    
+Step 2 — Isolated the broken block by deactivating plugins one by one via WP-CLI:
+
+# Deactivate all plugins silently from the command line
+wp plugin deactivate --all
+
+# Reactivate one at a time to find the culprit
+wp plugin activate custom-blocks
+
+# → Editor blank confirmed. Found it.
+
+
+
+
+
+Step 3 — Found the broken block attribute schema in the custom block registration:
+
+// custom-blocks/src/hero-block/index.js
+
+// BEFORE — Broken: attributes.className could be undefined after WP 6.4 schema change
+registerBlockType('custom/hero-block', {
+    attributes: {
+        heading:   { type: 'string' },
+        subtext:   { type: 'string' },
+        // className attribute was being assumed but not explicitly declared
+    },
+    edit: ({ attributes }) => {
+        // This line crashed when className was undefined
+        const classes = 'hero-block ' + attributes.className.trim(); // Crash
+        return <div className={classes}>...</div>;
+    },
+});
+
+
+
+
+Step 4 — Fixed the attribute declaration and added a null guard:
+javascript// custom-blocks/src/hero-block/index.js
+
+// AFTER — Fixed: className declared with default, null-safe access
+registerBlockType('custom/hero-block', {
+    attributes: {
+        heading:   { type: 'string', default: '' },
+        subtext:   { type: 'string', default: '' },
+        className: { type: 'string', default: '' }, //  Explicitly declared
+    },
+    edit: ({ attributes }) => {
+        // Safe: className always has a value due to default
+        const classes = ('hero-block ' + (attributes.className || '')).trim();
+        return <div className={classes}>...</div>;
+    },
+    save: ({ attributes }) => {
+        const classes = ('hero-block ' + (attributes.className || '')).trim();
+        return <div className={classes}>...</div>;
+    },
+});
+
+
+
+
+Step 5 — Added a React Error Boundary to the custom block plugin so future JS errors degrade gracefully instead of wiping the entire editor:
+// custom-blocks/src/utils/ErrorBoundary.js
+import { Component } from '@wordpress/element';
+
+class BlockErrorBoundary extends Component {
+    constructor(props) {
+        super(props);
+        this.state = { hasError: false, error: null };
+    }
+
+    static getDerivedStateFromError(error) {
+        return { hasError: true, error };
+    }
+
+    componentDidCatch(error, info) {
+        console.error('Block render error:', error, info);
+    }
+
+    render() {
+        if (this.state.hasError) {
+            return (
+                <div style={{ padding: '20px', border: '2px solid red', color: 'red' }}>
+                    Block failed to render: { this.state.error?.message }
+                    <br />
+                    <small>Check console for details. Other blocks are unaffected.</small>
+                </div>
+            );
+        }
+        return this.props.children;
+    }
+}
+
+
+// Wrap every custom block's edit function:
+edit: (props) => (
+    <BlockErrorBoundary>
+        <HeroBlockEdit { ...props } />
+    </BlockErrorBoundary>
+),
+The editor was fully restored within 2 hours and all other content team members were unblocked. 
+
+
+
+
+
+

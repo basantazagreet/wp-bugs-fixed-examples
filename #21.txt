@@ -1,0 +1,33 @@
+Bug Title / Short Description (one liner) :  "Password reset emails are never arriving"
+Bug category: Authentication & User Management
+Description:
+Users on a membership site couldn't reset their passwords — the reset email simply never arrived, blocking hundreds of users from accessing their accounts.
+
+Main Cause:
+WordPress's default wp_mail() was using PHP's mail() function, which the hosting provider had disabled for spam prevention. Emails were silently dropped.
+
+What We Did:
+Configured WordPress to send email via SMTP using the client's email provider (in this case, Gmail Workspace), without relying on a bloated plugin:
+
+
+// functions.php — Lightweight SMTP configuration
+add_action('phpmailer_init', function(PHPMailer\PHPMailer\PHPMailer $phpmailer) {
+    $phpmailer->isSMTP();
+    $phpmailer->Host       = 'smtp.gmail.com';
+    $phpmailer->SMTPAuth   = true;
+    $phpmailer->Port       = 587;
+    $phpmailer->Username   = 'noreply@xyz.com';
+    $phpmailer->Password   = 'app-specific-password'; // Use app password, not account password
+    $phpmailer->SMTPSecure = PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
+    $phpmailer->From       = 'noreply@xyz.com';
+    $phpmailer->FromName   = 'Client Site Name';
+});
+
+
+Password resets started delivering instantly. We also tested with wp_mail() debug logging to confirm email delivery. 
+
+
+
+
+
+

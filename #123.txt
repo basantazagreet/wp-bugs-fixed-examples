@@ -1,0 +1,157 @@
+Bug Title / Short Description (one liner) : "I changed the site URL in Settings and now I'm completely locked out of everything" 
+Bug category: Core Settings & Options API
+
+
+Description:
+A client was migrating their site from a subdirectory (https://clientsite.com/blog) to the root domain (https://clientsite.com). They updated the Site Address (URL) field in Settings → General — but accidentally set only siteurl to the new URL while leaving home pointing to the old subdirectory. WordPress immediately became inaccessible — the frontend redirected to a broken URL, wp-admin returned a 404, and the client was completely locked out with no way to get back in through the browser.
+
+
+
+Main Cause:
+WordPress uses two separate options to control routing:
+
+siteurl — where WordPress core files are installed
+home — the URL visitors are sent to (the "front" of the site)
+
+When these two values are mismatched, WordPress enters a broken redirect loop. Setting siteurl to the root while home still pointed to /blog/ caused every request to bounce between URLs indefinitely until the browser gave up. Because both the frontend and wp-admin were affected, there was no in-browser recovery path.
+
+
+
+
+
+
+
+What We Did:
+
+
+
+Step 1 — Bypassed the database entirely by hardcoding the correct URLs in wp-config.php:
+
+// wp-config.php — Emergency URL override
+// These constants take PRIORITY over whatever is stored in wp_options
+// They also cannot be changed from within the WordPress admin while set here
+// which is exactly what we want during recovery
+
+define('WP_HOME',    'https://clientsite.com');
+define('WP_SITEURL', 'https://clientsite.com');
+
+This immediately restored access to both the frontend and wp-admin without touching the database.
+
+
+
+
+
+Step 2 — Fixed the database values to match, then removed the constants:
+
+# Fix both options via WP-CLI — safe and handles serialized data correctly
+wp option update siteurl 'https://clientsite.com'
+wp option update home    'https://clientsite.com'
+
+# Verify both are now consistent
+wp option get siteurl
+wp option get home
+
+# Run search-replace to fix all content URLs at the same time
+wp search-replace 'https://clientsite.com/blog' 'https://clientsite.com' \
+    --all-tables --precise --skip-columns=guid
+
+# Flush rewrite rules so new URL structure works
+wp rewrite flush --hard
+
+
+
+
+
+
+
+Step 3 — Removed the wp-config.php constants after confirming database values were correct:
+
+// wp-config.php — Removed emergency constants after DB fix
+// define('WP_HOME',    'https://clientsite.com');  // Removed — DB is now correct
+// define('WP_SITEURL', 'https://clientsite.com');  // Removed — DB is now correct
+
+// Added instead: a safety valve that warns if these diverge in future
+if (defined('WP_DEBUG') && WP_DEBUG) {
+    add_action('admin_init', function() {
+        $siteurl = get_option('siteurl');
+        $home    = get_option('home');
+        if (rtrim($siteurl, '/') !== rtrim($home, '/')) {
+            error_log("WARNING: siteurl ($siteurl) and home ($home) are mismatched.");
+        }
+    });
+}
+
+
+
+
+
+
+Step 4 — Added a pre-save validation hook to prevent the mismatch from being introduced again via the UI:
+
+// functions.php — Warn admin if siteurl/home are being set to different values
+
+add_action('update_option_siteurl', function($old_value, $new_value) {
+    $home = get_option('home');
+    if (rtrim($new_value, '/') !== rtrim($home, '/')) {
+        // Can't abort the save here, but we can flag it immediately
+        add_action('admin_notices', function() use ($new_value, $home) {
+            echo '<div class="notice notice-warning is-dismissible"><p>';
+            printf(
+                '<strong>Warning:</strong> Your Site URL (%s) and Home URL (%s) are now different. ' .
+                'This may cause redirect loops or broken page access. ' .
+                '<a href="%s">Review General Settings</a>.',
+                esc_html($new_value),
+                esc_html($home),
+                esc_url(admin_url('options-general.php'))
+            );
+            echo '</p></div>';
+        });
+    }
+}, 10, 2);
+
+
+
+
+
+
+Step 5 — Created a URL recovery cheatsheet and added it as a sticky admin notice:
+
+// functions.php — Permanent admin reminder about URL recovery procedure
+add_action('admin_notices', function() {
+    if (!current_user_can('manage_options')) return;
+    if (get_option('url_recovery_notice_dismissed')) return;
+
+    echo '<div class="notice notice-info is-dismissible" id="url-recovery-notice"><p>';
+    echo '<strong>Admin Tip:</strong> If you ever get locked out after changing Site URL settings, ';
+    echo 'add <code>define(\'WP_HOME\', \'https://yoursite.com\');</code> and ';
+    echo '<code>define(\'WP_SITEURL\', \'https://yoursite.com\');</code> ';
+    echo 'to the top of <code>wp-config.php</code> to immediately restore access.';
+    echo '</p></div>';
+    echo '<script>
+        document.querySelector("#url-recovery-notice .notice-dismiss")
+            ?.addEventListener("click", () =>
+                fetch(ajaxurl + "?action=dismiss_url_notice&nonce=' .
+                    wp_create_nonce('dismiss_url_notice') . '")
+            );
+    </script>';
+});
+
+add_action('wp_ajax_dismiss_url_notice', function() {
+    check_ajax_referer('dismiss_url_notice', 'nonce');
+    update_option('url_recovery_notice_dismissed', true);
+    wp_send_json_success();
+});
+
+
+
+
+
+
+The site was fully accessible again within 3 minutes of adding the wp-config.php constants. Full migration was completed cleanly within the hour. 
+
+
+
+
+
+
+

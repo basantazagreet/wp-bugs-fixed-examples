@@ -1,0 +1,250 @@
+Bug Title / Short Description (one liner) :  "We tried to update a plugin and now the site is stuck in maintenance mode — rolling back didn't help"
+Bug category: Updates & Upgrade System 
+
+
+Description: 
+A WooCommerce store client attempted to update the Elementor Pro plugin via the WordPress admin dashboard. The update appeared to stall — the progress bar stopped at 67% and the browser tab showed "loading" for 20 minutes. The client force-refreshed the page, which broke the update mid-stream. The site was now stuck in maintenance mode, wp-admin was inaccessible, and when the client attempted to roll back Elementor Pro using a rollback plugin, the rollback itself failed silently — leaving the plugin directory in a partially overwritten state with mixed old and new files.
+
+
+
+
+
+Main Cause:
+Three failures cascaded:
+
+The Elementor Pro update stalled because it was downloading a 47MB package over a slow server connection, and the PHP max_execution_time of 60 seconds expired during the download — leaving the .maintenance file in place and the plugin directory in a partially extracted state.
+The force-refresh interrupted WordPress's upgrade lock, causing subsequent attempts to believe an upgrade was still in progress.
+The rollback plugin used a ZIP-based restore that extracted over the partial update — but because some new files had already replaced old ones and the rollback ZIP contained the old versions, the result was a mixed-version plugin directory with incompatible old and new files side by side.
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Cleared the stuck state immediately via SFTP/SSH:
+
+# 1. Remove the maintenance file
+rm /var/www/html/.maintenance
+
+# 2. Check the Elementor Pro directory state
+ls -la /var/www/html/wp-content/plugins/elementor-pro/
+# Showed mix of timestamps — some files from 2 days ago (old), some from today (partial new)
+
+# 3. Check for any WordPress upgrade lock file
+ls /var/www/html/wp-content/upgrade/
+# Found: elementor-pro.tmp/ — partial extraction directory
+
+# 4. Remove the incomplete upgrade artifacts
+rm -rf /var/www/html/wp-content/upgrade/elementor-pro.tmp/
+
+
+
+
+
+
+Step 2 — Restored Elementor Pro to a known-good state by deploying a clean copy:
+
+# Download the specific known-good version of Elementor Pro via WP-CLI
+# (requires Elementor Pro license — use your own download URL)
+wp plugin install https://your-elementor-pro-download-url.zip \
+    --force \
+    --activate
+
+# If WP-CLI is unavailable, deploy via SFTP:
+# 1. Download clean copy locally
+# 2. Delete the corrupted wp-content/plugins/elementor-pro/ directory entirely via SFTP
+# 3. Upload the clean extracted plugin folder
+# 4. This is safer than overwriting — guarantees no mixed-version files remain
+
+# Verify plugin is intact
+wp plugin verify-checksums elementor
+# Note: Elementor Pro checksums aren't in WP.org — verify manually
+
+# Check plugin loads without errors
+wp eval --skip-themes 'echo class_exists("ElementorPro\Plugin") ? "OK" : "MISSING";'
+
+
+
+
+
+
+
+Step 3 — Built a proper pre-update plugin backup system using filesystem snapshots:
+
+// functions.php — Create full plugin backup before any update
+
+add_filter('upgrader_pre_install', function($response, $hook_extra) {
+    if (!isset($hook_extra['plugin'])) return $response;
+
+    $plugin_slug    = dirname($hook_extra['plugin']);
+    $plugin_dir     = WP_PLUGIN_DIR . '/' . $plugin_slug;
+    $backup_dir     = WP_CONTENT_DIR . '/plugin-backups/';
+    $timestamp      = date('Y-m-d_H-i-s');
+    $backup_path    = $backup_dir . $plugin_slug . '_' . $timestamp . '.zip';
+
+    if (!is_dir($backup_dir)) mkdir($backup_dir, 0755, true);
+    if (!is_dir($plugin_dir)) return $response;
+
+    // Create ZIP backup of current plugin state
+    $zip = new ZipArchive();
+    if ($zip->open($backup_path, ZipArchive::CREATE) === true) {
+        $files = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($plugin_dir, FilesystemIterator::SKIP_DOTS)
+        );
+        foreach ($files as $file) {
+            if (!$file->isFile()) continue;
+            $relative = str_replace($plugin_dir . '/', '', $file->getRealPath());
+            $zip->addFile($file->getRealPath(), $plugin_slug . '/' . $relative);
+        }
+        $zip->close();
+
+        // Store backup path so rollback can find it
+        update_option("plugin_backup_{$plugin_slug}", [
+            'path'      => $backup_path,
+            'timestamp' => $timestamp,
+            'size'      => filesize($backup_path),
+        ]);
+
+        error_log("Plugin backup created: $backup_path (" . filesize($backup_path) . " bytes)");
+    }
+
+    return $response;
+}, 10, 2);
+
+
+
+
+
+Step 4 — Created a reliable rollback function that does a clean delete-then-restore:
+
+// functions.php — Safe plugin rollback using pre-update backup
+
+function safe_plugin_rollback($plugin_slug) {
+    $backup_info = get_option("plugin_backup_{$plugin_slug}");
+
+    if (!$backup_info || !file_exists($backup_info['path'])) {
+        return new WP_Error('no_backup', "No backup found for plugin: $plugin_slug");
+    }
+
+    $plugin_dir  = WP_PLUGIN_DIR . '/' . $plugin_slug;
+    $backup_path = $backup_info['path'];
+
+    // Step 1: Deactivate the plugin
+    deactivate_plugins($plugin_slug . '/' . $plugin_slug . '.php');
+
+    // Step 2: COMPLETELY remove the current plugin directory
+    // This is the critical step — partial overwrites cause mixed-version disasters
+    $files = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($plugin_dir, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+    foreach ($files as $file) {
+        $file->isDir() ? rmdir($file->getRealPath()) : unlink($file->getRealPath());
+    }
+    rmdir($plugin_dir);
+
+    // Step 3: Extract backup ZIP into plugins directory
+    $zip = new ZipArchive();
+    if ($zip->open($backup_path) === true) {
+        $zip->extractTo(WP_PLUGIN_DIR);
+        $zip->close();
+        error_log("Plugin rollback complete: $plugin_slug restored from $backup_path");
+        return true;
+    }
+
+    return new WP_Error('extract_failed', "Failed to extract backup for: $plugin_slug");
+}
+
+// Add a rollback action to the plugin management AJAX
+add_action('wp_ajax_rollback_plugin', function() {
+    check_ajax_referer('rollback_plugin_nonce', 'nonce');
+    if (!current_user_can('update_plugins')) wp_send_json_error('Permission denied.', 403);
+
+    $plugin_slug = sanitize_key($_POST['plugin_slug'] ?? '');
+    $result      = safe_plugin_rollback($plugin_slug);
+
+    if (is_wp_error($result)) {
+        wp_send_json_error($result->get_error_message());
+    }
+    wp_send_json_success("Plugin $plugin_slug rolled back successfully.");
+});
+
+
+
+
+
+
+
+Step 5 — Added an update progress monitor to detect and recover from stalled updates automatically:
+
+// wp-content/mu-plugins/update-progress-monitor.php
+
+add_action('upgrader_process_complete', function($upgrader, $hook_extra) {
+    // Update completed successfully — clear any stall detection data
+    delete_transient('update_started_at');
+    delete_transient('update_in_progress_slug');
+}, 10, 2);
+
+add_filter('upgrader_pre_install', function($response, $hook_extra) {
+    // Record that an update is starting
+    set_transient('update_started_at',         time(),                  30 * MINUTE_IN_SECONDS);
+    set_transient('update_in_progress_slug',   $hook_extra['plugin'] ?? 'core', 30 * MINUTE_IN_SECONDS);
+    return $response;
+}, 10, 2);
+
+
+// Check for stalled updates on every admin page load
+add_action('admin_init', function() {
+    $started_at  = get_transient('update_started_at');
+    $stall_limit = 15 * MINUTE_IN_SECONDS; // Flag as stalled after 15 minutes
+
+    if ($started_at && (time() - $started_at) > $stall_limit) {
+        $slug = get_transient('update_in_progress_slug') ?: 'unknown';
+
+        // Clean up stall state
+        delete_transient('update_started_at');
+        delete_transient('update_in_progress_slug');
+
+        // Remove maintenance file if present
+        $maintenance = ABSPATH . '.maintenance';
+        if (file_exists($maintenance)) {
+            unlink($maintenance);
+            error_log("Stalled update detected for '$slug'. Maintenance file removed.");
+        }
+
+        add_action('admin_notices', function() use ($slug) {
+            echo '<div class="notice notice-error"><p>';
+            printf(
+                '<strong>Update Warning:</strong> The update for <code>%s</code> may have stalled. ' .
+                'Please verify the plugin is in a consistent state before proceeding.',
+                esc_html($slug)
+            );
+            echo '</p></div>';
+        });
+    }
+});
+
+
+
+
+
+Elementor Pro was fully restored to its pre-update state within 25 minutes. The backup system was deployed across all 14 sites the agency manages — ensuring every future plugin update has a one-click clean rollback path. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+Main Cause:
+
+
+What we Did:

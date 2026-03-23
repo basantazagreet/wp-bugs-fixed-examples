@@ -1,0 +1,185 @@
+Bug Title / Short Description (one liner) : "After moving to a new server, every image on the site is a broken link"
+Bug category: Media & File Management
+
+
+Description: 
+An e-commerce client migrated their WooCommerce store from a shared host to a dedicated VPS. After migration, every single image on the site appeared as a broken icon — product photos, banners, gallery images, and thumbnails. The image files were physically present on the new server (the migration had copied them), but every <img> tag was pointing to the old server's URL.
+
+
+
+Main Cause:
+The migration plugin had copied files and exported the database, but the search-replace step had only partially completed — it had updated siteurl and home in wp_options, but had not replaced URLs stored inside serialized arrays throughout the database. WordPress stores image attachment metadata, product gallery IDs, widget settings, and page builder content in serialized PHP arrays. A naive string replace on serialized data corrupts the serialization structure (because the byte-length prefix no longer matches the string), causing data to silently fail to load.
+
+
+
+
+
+What We Did:
+
+
+Step 1 — Verified the scope of broken URLs using a targeted database search:
+
+#Find all occurrences of old domain in database
+
+SELECT 'wp_options' AS source, option_name AS identifier,
+       SUBSTRING(option_value, LOCATE('old-host.com', option_value) - 20, 60) AS context
+FROM wp_options
+WHERE option_value LIKE '%old-host.com%'
+
+UNION ALL
+
+
+SELECT 'wp_postmeta', meta_key,
+       SUBSTRING(meta_value, LOCATE('old-host.com', meta_value) - 20, 60)
+FROM wp_postmeta
+WHERE meta_value LIKE '%old-host.com%'
+
+UNION ALL
+
+
+SELECT 'wp_posts', post_title,
+       SUBSTRING(post_content, LOCATE('old-host.com', post_content) - 20, 60)
+FROM wp_posts
+WHERE post_content LIKE '%old-host.com%'
+
+LIMIT 50;
+
+
+
+
+
+
+Step 2 — Used WP-CLI's search-replace with serialization-safe mode to replace all URLs correctly:
+
+# WP-CLI handles serialized data safely — this is the ONLY correct way to do this
+
+# The --precise flag ensures serialization byte counts are recalculated after replacement
+
+wp search-replace \
+    'https://old-host.com' \
+    'https://new-vps-site.com' \
+    --all-tables \
+    --precise \
+    --report-changed-only \
+    --skip-columns=guid
+
+
+# Also replace HTTP variant if old site had mixed content
+wp search-replace \
+    'http://old-host.com' \
+    'https://new-vps-site.com' \
+    --all-tables \
+    --precise \
+    --report-changed-only \
+    --skip-columns=guid
+
+# Verify no old URLs remain
+wp search-replace 'old-host.com' 'old-host.com' --dry-run --all-tables | grep -v "0 replacements"
+
+
+
+
+
+Step 3 — Regenerated all image thumbnails because some intermediate sizes had been generated with absolute paths baked in:
+
+bash# Regenerate all attachment sizes using WP-CLI
+# --yes skips confirmation prompt
+wp media regenerate --yes
+
+# For large media libraries, process in batches to avoid timeout
+wp post list --post_type=attachment --post_mime_type=image --format=ids | \
+    xargs -d ' ' -I{} wp media regenerate {} --yes
+    
+    
+    
+    
+   
+Step 4 — Fixed attachment metadata that still contained old-domain paths in serialized arrays:
+
+// fix-attachment-urls.php — Run via: wp eval-file fix-attachment-urls.php
+global $wpdb;
+
+$old_domain = 'old-host.com';
+$new_domain = 'new-vps-site.com';
+
+// Get all attachments with metadata containing old domain
+$attachments = $wpdb->get_results("
+    SELECT post_id, meta_value
+    FROM {$wpdb->postmeta}
+    WHERE meta_key   = '_wp_attachment_metadata'
+    AND   meta_value LIKE '%{$old_domain}%'
+");
+
+$fixed = 0;
+foreach ($attachments as $attachment) {
+    // Unserialize, fix, reserialize — never do string replace on serialized data
+    $meta = maybe_unserialize($attachment->meta_value);
+    if (!is_array($meta)) continue;
+
+    // Recursively replace old domain in the metadata array
+    array_walk_recursive($meta, function(&$value) use ($old_domain, $new_domain) {
+        if (is_string($value)) {
+            $value = str_replace($old_domain, $new_domain, $value);
+        }
+    });
+
+    update_post_meta($attachment->post_id, '_wp_attachment_metadata', $meta);
+    $fixed++;
+}
+
+echo "Fixed metadata for {$fixed} attachments.\n";
+
+
+
+
+
+
+Step 5 — Set up a post-migration validation script for future use:
+
+// migration-validator.php — Run after any migration to catch broken assets
+// Usage: wp eval-file migration-validator.php
+
+
+$current_domain = parse_url(get_site_url(), PHP_URL_HOST);
+$issues         = [];
+
+
+// Check for old domains in common tables
+global $wpdb;
+$tables_to_check = [$wpdb->options, $wpdb->postmeta, $wpdb->posts];
+
+foreach ($tables_to_check as $table) {
+    $count = $wpdb->get_var("
+        SELECT COUNT(*) FROM {$table}
+        WHERE CONCAT_WS('|',
+            " . ($table === $wpdb->options ? 'option_value' :
+               ($table === $wpdb->postmeta ? 'meta_value' : 'post_content')) . "
+        ) REGEXP 'https?://(?!{$current_domain})[a-zA-Z0-9.-]+\.(com|net|org)/wp-content'
+    ");
+    if ($count > 0) {
+        $issues[] = "{$table}: {$count} rows may contain old domain asset URLs";
+    }
+}
+
+if (empty($issues)) {
+    echo "Migration validation passed — no cross-domain asset URLs detected.\n";
+} else {
+    echo "Migration issues found:\n";
+    foreach ($issues as $issue) echo "  - {$issue}\n";
+}
+
+
+
+
+
+
+
+Every broken image was restored. Product photos, gallery images, and banners all loaded correctly on the new server within 2 hours of the WP-CLI search-replace. 
+
+
+
+
+
+
+
+

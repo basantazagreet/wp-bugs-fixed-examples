@@ -1,0 +1,135 @@
+Bug Title / Short Description (one liner) :  "Our WordPress admin takes 20+ seconds to load any page"
+Bug category: Database & Query Layer
+
+
+Description: 
+A real estate client with a large property listing site (~40,000 posts) reported that the WordPress admin panel had become unusably slow — the post list screen took 20–30 seconds to load, filtering by property type timed out entirely, and the dashboard widgets were hanging. The frontend was slow too but more tolerable.
+
+
+Main Cause:
+The site was running multiple WP_Query calls that filtered by custom post meta fields (_property_type, _price_range, _bedrooms) with no database indexes on the meta_key and meta_value columns in wp_postmeta. Every query was triggering a full table scan across 800,000+ rows in wp_postmeta. MySQL's slow query log confirmed queries were taking 18–25 seconds each.
+
+
+What We Did
+
+Step 1 — Enabled and read the slow query log:
+
+#Check slow query log status
+
+SHOW VARIABLES LIKE 'slow_query_log';
+SHOW VARIABLES LIKE 'long_query_time';
+
+#Enable if not active (or set in my.cnf)
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 2;
+SET GLOBAL slow_query_log_file = '/var/log/mysql/slow.log';
+
+
+
+
+Step 2 — Ran EXPLAIN on the worst offender:
+
+EXPLAIN SELECT * FROM wp_posts
+INNER JOIN wp_postmeta ON wp_posts.ID = wp_postmeta.post_id
+WHERE wp_postmeta.meta_key = '_property_type'
+AND wp_postmeta.meta_value = 'villa'
+AND wp_posts.post_status = 'publish';
+
+
+#Result: type = ALL (full table scan), rows = 847,293 
+
+
+
+
+Step 3 — Added composite indexes on wp_postmeta:
+
+#Add index on meta_key + meta_value for fast lookups
+
+ALTER TABLE wp_postmeta
+ADD INDEX idx_meta_key_value (meta_key(191), meta_value(100));
+
+
+Add index on post_id + meta_key for JOIN performance
+
+
+ALTER TABLE wp_postmeta
+ADD INDEX idx_post_meta (post_id, meta_key(191));
+
+
+
+
+Re-run EXPLAIN after indexing:
+Result: type = ref, rows = 312 — 99.9% reduction in rows scanned
+
+
+
+
+
+Step 4 — Optimized the WP_Query calls to use meta_query with compare and type hints that leverage indexes:
+
+// BEFORE — Slow, unoptimized meta query
+$args = [
+    'post_type'  => 'property',
+    'meta_query' => [
+        ['key' => '_property_type', 'value' => 'villa'],
+        ['key' => '_price_range',   'value' => [500000, 1000000], 'compare' => 'BETWEEN', 'type' => 'NUMERIC'],
+    ],
+];
+
+
+// AFTER — Optimized with explicit types and JOIN strategy
+$args = [
+    'post_type'      => 'property',
+    'post_status'    => 'publish',
+    'posts_per_page' => 20,
+    'meta_query'     => [
+        'relation' => 'AND',
+        [
+            'key'     => '_property_type',
+            'value'   => 'villa',
+            'compare' => '=',
+            'type'    => 'CHAR',
+        ],
+        [
+            'key'     => '_price_range',
+            'value'   => [500000, 1000000],
+            'compare' => 'BETWEEN',
+            'type'    => 'NUMERIC',
+        ],
+    ],
+    // Use EXISTS instead of JOIN where possible for large datasets
+    'fields' => 'ids', // Fetch IDs only, then get full data separately
+];
+$property_ids = get_posts($args);
+
+
+
+
+
+Step 5 — Added a scheduled index health check:
+
+// functions.php — Weekly check that custom indexes still exist
+add_action('wp_check_db_indexes', function() {
+    global $wpdb;
+    $indexes = $wpdb->get_results("SHOW INDEX FROM {$wpdb->postmeta}");
+    $index_names = wp_list_pluck($indexes, 'Key_name');
+
+    if (!in_array('idx_meta_key_value', $index_names)) {
+        // Re-create missing index and alert admin
+        $wpdb->query("ALTER TABLE {$wpdb->postmeta} ADD INDEX idx_meta_key_value (meta_key(191), meta_value(100))");
+        wp_mail(get_option('admin_email'), 'DB Index Restored', 'The postmeta index was missing and has been restored.');
+    }
+});
+if (!wp_next_scheduled('wp_check_db_indexes')) {
+    wp_schedule_event(time(), 'weekly', 'wp_check_db_indexes');
+}
+
+
+
+
+
+Admin page load dropped from 28 seconds to under 1.2 seconds. 
+
+
+
+
